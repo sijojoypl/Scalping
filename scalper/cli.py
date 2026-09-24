@@ -13,6 +13,7 @@ from pathlib import Path
 from scalper.clock import RealClock, SimClock
 from scalper.config import Config, ConfigError, load_config
 from scalper.feeds import (
+    DukascopyFeed,
     FeedError,
     OandaFeed,
     ReplayFeed,
@@ -219,32 +220,51 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fetch_feed(cfg: Config, provider: str):
+    if provider == "dukascopy":
+        log.info("downloading one Dukascopy file per pair per day; this takes a minute or two")
+        return DukascopyFeed(
+            cfg.timeframe_minutes,
+            progress=lambda sym, n: log.info("%s: %s one-minute candles downloaded", sym, f"{n:,}"),
+        )
+    return _live_feed(cfg)
+
+
 def cmd_fetch(args: argparse.Namespace) -> int:
     cfg = _config(args)
-    if args.provider:
-        cfg.feed.provider = args.provider
+    provider = args.provider or cfg.feed.provider
+    if provider in ("yahoo", "oanda"):
+        cfg.feed.provider = provider
     cfg.validate()
     setup_logging("INFO")
-    if cfg.feed.provider not in ("yahoo", "oanda"):
-        print("fetch needs a live provider: --provider yahoo or --provider oanda", file=sys.stderr)
+    if provider not in ("yahoo", "oanda", "dukascopy"):
+        print("fetch needs a data source: --provider yahoo, dukascopy or oanda", file=sys.stderr)
         return 2
-    feed = _live_feed(cfg)
+    feed = _fetch_feed(cfg, provider)
     now = datetime.now(timezone.utc)
     out = Path(args.out)
-    status = 0
+    failed = []
     count = args.days * 1440 // cfg.timeframe_minutes
     cutoff = now - timedelta(days=args.days)
-    for symbol in _symbols_with_aux(cfg):
+    symbols = _symbols_with_aux(cfg)
+    for symbol in symbols:
         try:
             bars = [b for b in feed.fetch_closed(symbol, count, now) if b.time >= cutoff]
         except FeedError as exc:
             log.error("%s", exc)
-            status = 1
+            failed.append(symbol)
             continue
         path = out / f"{symbol}_M{cfg.timeframe_minutes}.csv"
         save_csv(path, bars)
         log.info("%s: %d bars -> %s", symbol, len(bars), path)
-    return status
+    if failed and provider == "yahoo":
+        print(
+            "\nYahoo refused some or all requests. Other free sources:\n"
+            "  python -m scalper fetch --provider dukascopy     (no key needed)\n"
+            "  or export 5-minute CSVs from TradingView into the data folder (see README)",
+            file=sys.stderr,
+        )
+    return 1 if failed else 0
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
@@ -301,7 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_status)
 
     f = sub.add_parser("fetch", help="download recent candles to CSV for backtesting")
-    f.add_argument("--provider", choices=["yahoo", "oanda"], help="override feed.provider")
+    f.add_argument("--provider", choices=["yahoo", "dukascopy", "oanda"], help="data source (default feed.provider)")
     f.add_argument("--days", type=int, default=45, help="calendar days of history (default 45; Yahoo keeps ~59)")
     f.add_argument("--out", default="data", help="output folder (default data)")
     f.set_defaults(func=cmd_fetch)

@@ -51,9 +51,17 @@ Synthetic prices are random walks. They exercise the plumbing, and their P&L tel
 A one-month backtest on real prices takes two commands:
 
 ```bash
-python -m scalper fetch                 # last 45 days of M5 candles into data/ (Yahoo, or OANDA if configured)
+python -m scalper fetch                 # last 45 days of M5 candles into data/
 python -m scalper backtest --days 30    # trade the last 30 days; the 15 days before warm up the indicators
 ```
+
+`fetch` can pull from three places:
+
+| command                                  | source                                                     |
+|------------------------------------------|------------------------------------------------------------|
+| `python -m scalper fetch`                | Yahoo (default). Free, but Yahoo sometimes refuses with HTTP 429, especially from servers and VPSs. |
+| `python -m scalper fetch --provider dukascopy` | Dukascopy's free historical data, no key. One file per pair per day, so it takes a minute or two. Prices are bid, not mid. |
+| `python -m scalper fetch --provider oanda`     | OANDA, needs `OANDA_API_TOKEN` (free practice account). |
 
 Useful variations:
 
@@ -63,9 +71,20 @@ python -m scalper backtest --days 30 --trades-out trades.csv
 python -m scalper backtest --days 30 --log-level INFO   # print every signal, fill and exit
 ```
 
-Without `--days` the backtest uses every bar in `data/`. Yahoo keeps about 59 days of 5-minute history, so `fetch --days 59` is the most it can give. OANDA goes back further; the bot pages through its 5000-candle limit.
+Without `--days` the backtest uses every bar in `data/`. Yahoo keeps about 59 days of 5-minute history, so `fetch --days 59` is the most it can give; Dukascopy and OANDA go back further.
 
-You can also drop in your own CSVs, one per pair, named after it (`data/USDCHF_M5.csv`, `data/CHFJPY.csv`, ...). TradingView exports, MT4/MT5 exports, Dukascopy downloads and ISO-timestamp files all load. For the cross pairs, also add the USD pair that prices the quote currency: `USDJPY` for CHFJPY, `USDCAD` for AUDCAD, `AUDUSD` for GBPAUD. Without those files the bot falls back to the fixed rates in `fx_fallback_rates`. `fetch` downloads them automatically.
+#### Using data exported from TradingView
+
+TradingView can export the candles on a chart as CSV, and the bot reads that format directly. For each of USDCHF, CHFJPY, AUDCAD and GBPAUD, plus USDJPY, USDCAD and AUDUSD (used to convert profits to USD):
+
+1. Open the pair on a 5-minute chart, for example `FX:USDCHF` (FXCM, the feed the README results used).
+2. Scroll left until at least 45 days are loaded.
+3. Open the layout menu (the arrow next to the layout name, top right) and pick "Export chart data...". Keep the default time format.
+4. Save the file into the `data` folder. The default name, such as `FX_USDCHF, 5.csv`, is fine.
+
+Then run `python -m scalper backtest --days 30`. Export availability depends on your TradingView plan.
+
+Any other CSV with time/open/high/low/close columns also works (MT4/MT5 exports, Dukascopy downloads, ISO timestamps). Name it after the pair, for example `data/USDCHF_M5.csv`. Without the three USD pairs the bot falls back to the fixed rates in `fx_fallback_rates`.
 
 ### Data feeds
 

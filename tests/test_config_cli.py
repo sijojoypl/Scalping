@@ -110,3 +110,16 @@ def test_cli_fetch_then_one_month_backtest(tmp_path, capsys, monkeypatch):
 def test_cli_backtest_without_data_explains_fetch(tmp_path, capsys):
     assert main(["backtest", "--data-dir", str(tmp_path / "empty")]) == 2
     assert "scalper fetch" in capsys.readouterr().err
+
+
+def test_cli_fetch_points_to_other_sources_when_yahoo_refuses(tmp_path, capsys, monkeypatch):
+    import scalper.cli as cli
+    from scalper.feeds import FeedError
+
+    class Refusing:
+        def fetch_closed(self, symbol, count, now):
+            raise FeedError("Yahoo request failed after 4 tries: HTTP 429 Too Many Requests")
+
+    monkeypatch.setattr(cli, "_live_feed", lambda cfg: Refusing())
+    assert main(["fetch", "--out", str(tmp_path)]) == 1
+    assert "--provider dukascopy" in capsys.readouterr().err

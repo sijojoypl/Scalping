@@ -5,6 +5,9 @@ Every feed returns *closed* bars only, oldest first, with UTC open times.
 * ``YahooFeed``  - free Yahoo Finance chart API, no key (default for paper mode)
 * ``OandaFeed``  - OANDA v20 candles; needs an API token (a free practice
                    account works). Only candles are read, no orders are sent.
+* ``DukascopyFeed`` - Dukascopy's free historical 1-minute candles, no key.
+                   Published per finished day, so it is for ``fetch`` and
+                   backtests, not live polling.
 * ``ReplayFeed`` - historical bars (CSV files or synthetic data) replayed
                    against a simulated clock
 """
@@ -13,9 +16,13 @@ from __future__ import annotations
 
 import bisect
 import csv
+import lzma
 import math
 import os
 import random
+import re
+import struct
+import time
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -41,8 +48,38 @@ def is_closed(bar_time: datetime, tf: timedelta, now: datetime) -> bool:
 
 
 # --------------------------------------------------------------------- Yahoo
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
+
+
+def browser_session():
+    """An HTTP session Yahoo (and Dukascopy) will talk to.
+
+    Yahoo answers 429 "Too Many Requests" to clients that do not look like a
+    browser, sometimes on the very first request. ``curl_cffi`` (in
+    requirements.txt) makes the TLS handshake look like Chrome's, which is
+    what the yfinance library switched to for the same reason. Without it,
+    fall back to ``requests`` with browser headers.
+    """
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        session = requests.Session()
+        session.headers.update(
+            {
+                "User-Agent": BROWSER_USER_AGENT,
+                "Accept": "application/json,text/plain,*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+        )
+        return session
+    return cffi_requests.Session(impersonate="chrome")
+
+
 class YahooFeed:
-    URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
     INTERVALS = {1: "1m", 5: "5m", 15: "15m", 30: "30m", 60: "60m"}
     MAX_DAYS = {1: 7, 5: 59, 15: 59, 30: 59, 60: 700}
 
@@ -50,8 +87,12 @@ class YahooFeed:
         self,
         timeframe_minutes: int,
         timeout: float = 20.0,
-        session: requests.Session | None = None,
+        session=None,
         settle_seconds: float = 10.0,
+        retries: int = 3,
+        backoff_seconds: float = 3.0,
+        min_interval_seconds: float = 1.0,
+        sleep=time.sleep,
     ):
         self.tf_minutes = timeframe_minutes
         self.tf = timedelta(minutes=timeframe_minutes)
@@ -59,8 +100,12 @@ class YahooFeed:
         # seconds after it closes, so wait this long before trusting it.
         self.settle = timedelta(seconds=settle_seconds)
         self.timeout = timeout
-        self.session = session or requests.Session()
-        self.session.headers.setdefault("User-Agent", "Mozilla/5.0 (reverse-rsi-paper-bot)")
+        self.session = session if session is not None else browser_session()
+        self.retries = retries
+        self.backoff = backoff_seconds
+        self.min_interval = min_interval_seconds
+        self._sleep = sleep
+        self._last_request = -math.inf
 
     def fetch_closed(self, symbol: str, count: int, now: datetime) -> list[Bar]:
         # Forex trades ~5 days a week; ask for enough calendar days to cover
@@ -73,18 +118,40 @@ class YahooFeed:
             "period2": int(now.timestamp()) + 60,
             "includePrePost": "false",
         }
-        url = self.URL.format(ticker=f"{normalize_symbol(symbol)}=X")
-        try:
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            resp.raise_for_status()
-            payload = resp.json()
-        except (requests.RequestException, ValueError) as exc:
-            raise FeedError(f"Yahoo request for {symbol} failed: {exc}") from exc
+        payload = self._request(normalize_symbol(symbol), params)
         try:
             bars = self.parse(payload, self.tf_minutes)
         except (KeyError, TypeError, IndexError, ValueError, AttributeError) as exc:
             raise FeedError(f"unexpected Yahoo response for {symbol}: {exc!r}") from exc
         return [b for b in bars if is_closed(b.time, self.tf + self.settle, now)][-count:]
+
+    def _request(self, symbol: str, params: dict) -> dict:
+        """GET the chart JSON, retrying 429/5xx and network errors with backoff."""
+        problem = ""
+        for attempt in range(self.retries + 1):
+            if attempt:
+                self._sleep(self.backoff * 2 ** (attempt - 1))
+            wait = self._last_request + self.min_interval - time.monotonic()
+            if wait > 0:
+                self._sleep(wait)
+            self._last_request = time.monotonic()
+            url = f"https://{self.HOSTS[attempt % len(self.HOSTS)]}/v8/finance/chart/{symbol}=X"
+            try:
+                resp = self.session.get(url, params=params, timeout=self.timeout)
+            except OSError as exc:  # requests and curl_cffi errors both derive from OSError
+                problem = str(exc)
+                continue
+            status = resp.status_code
+            if status == 429 or status >= 500:
+                problem = f"HTTP {status}" + (" Too Many Requests" if status == 429 else "")
+                continue
+            if status >= 400:
+                raise FeedError(f"Yahoo request for {symbol} failed: HTTP {status}")
+            try:
+                return resp.json()
+            except ValueError as exc:
+                raise FeedError(f"Yahoo sent a non-JSON reply for {symbol}: {exc}") from exc
+        raise FeedError(f"Yahoo request for {symbol} failed after {self.retries + 1} tries: {problem}")
 
     @staticmethod
     def parse(payload: dict, tf_minutes: int) -> list[Bar]:
@@ -199,6 +266,119 @@ class OandaFeed:
                 )
             )
         return bars
+
+
+# ----------------------------------------------------------------- Dukascopy
+class DukascopyFeed:
+    """Free historical candles from Dukascopy's public datafeed.
+
+    Each UTC day is one LZMA-compressed ``.bi5`` file of 1-minute BID candles.
+    A record is 24 big-endian bytes: seconds since midnight, open, close, low
+    and high as integer points, and a float volume. Minutes with no volume
+    (weekends, market closed) are dropped, the rest are merged into bars of the
+    configured timeframe.
+    """
+
+    URL = "https://datafeed.dukascopy.com/datafeed/{symbol}/{y}/{m:02d}/{d:02d}/BID_candles_min_1.bi5"
+    RECORD = struct.Struct(">5if")
+
+    def __init__(
+        self,
+        timeframe_minutes: int,
+        timeout: float = 30.0,
+        session=None,
+        retries: int = 3,
+        backoff_seconds: float = 3.0,
+        pause_seconds: float = 0.3,
+        sleep=time.sleep,
+        progress=None,
+    ):
+        self.tf_minutes = timeframe_minutes
+        self.tf = timedelta(minutes=timeframe_minutes)
+        self.timeout = timeout
+        self.session = session if session is not None else browser_session()
+        self.retries = retries
+        self.backoff = backoff_seconds
+        self.pause = pause_seconds
+        self._sleep = sleep
+        self._progress = progress
+
+    def fetch_closed(self, symbol: str, count: int, now: datetime) -> list[Bar]:
+        symbol = normalize_symbol(symbol)
+        scale = 1_000 if symbol.endswith("JPY") else 100_000  # prices are stored as integer points
+        days = math.ceil(count * self.tf_minutes / 1440) + 1
+        first_day = (now - timedelta(days=days)).date()
+        minutes: list[Bar] = []
+        day = first_day
+        while day <= now.date():
+            raw = self._download(symbol, day)
+            if raw:
+                start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+                minutes.extend(self.decode(raw, start, scale, symbol))
+            day += timedelta(days=1)
+            self._sleep(self.pause)
+        if self._progress:
+            self._progress(symbol, len(minutes))
+        bars = aggregate(minutes, self.tf_minutes)
+        return [b for b in bars if is_closed(b.time, self.tf, now)][-count:]
+
+    def _download(self, symbol: str, day) -> bytes:
+        url = self.URL.format(symbol=symbol, y=day.year, m=day.month - 1, d=day.day)  # months are 0-based
+        problem = ""
+        for attempt in range(self.retries + 1):
+            if attempt:
+                self._sleep(self.backoff * 2 ** (attempt - 1))
+            try:
+                resp = self.session.get(url, timeout=self.timeout)
+            except OSError as exc:
+                problem = str(exc)
+                continue
+            if resp.status_code == 404:
+                return b""  # no file for this day (weekend, holiday or today)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                problem = f"HTTP {resp.status_code}"
+                continue
+            if resp.status_code >= 400:
+                raise FeedError(f"Dukascopy request for {symbol} {day} failed: HTTP {resp.status_code}")
+            return resp.content
+        raise FeedError(f"Dukascopy request for {symbol} {day} failed after {self.retries + 1} tries: {problem}")
+
+    @classmethod
+    def decode(cls, raw: bytes, day_start: datetime, scale: int, symbol: str = "") -> list[Bar]:
+        try:
+            data = lzma.decompress(raw)
+        except lzma.LZMAError as exc:
+            raise FeedError(f"Dukascopy {symbol} {day_start.date()}: not an LZMA file ({exc})") from exc
+        if len(data) % cls.RECORD.size:
+            raise FeedError(f"Dukascopy {symbol} {day_start.date()}: unexpected record size")
+        bars = []
+        for secs, o, c, lo, hi, volume in cls.RECORD.iter_unpack(data):
+            if volume <= 0:
+                continue
+            if not (lo <= min(o, c) and hi >= max(o, c) and lo > 0):
+                raise FeedError(
+                    f"Dukascopy {symbol} {day_start.date()}: candle fields out of order; "
+                    f"the file format may have changed"
+                )
+            bars.append(
+                Bar(day_start + timedelta(seconds=secs), o / scale, hi / scale, lo / scale, c / scale)
+            )
+        return bars
+
+
+def aggregate(bars: list[Bar], minutes: int) -> list[Bar]:
+    """Merge consecutive bars into ``minutes``-long bars aligned to the clock."""
+    step = minutes * 60
+    out: list[Bar] = []
+    for b in bars:
+        ts = int(b.time.timestamp())
+        start = datetime.fromtimestamp(ts - ts % step, tz=timezone.utc)
+        if out and out[-1].time == start:
+            last = out[-1]
+            out[-1] = Bar(start, last.open, max(last.high, b.high), min(last.low, b.low), b.close)
+        else:
+            out.append(Bar(start, b.open, b.high, b.low, b.close))
+    return out
 
 
 # -------------------------------------------------------------------- Replay
@@ -333,16 +513,23 @@ def save_csv(path: str | Path, bars: Iterable[Bar]) -> None:
 
 
 def find_csv(data_dir: str | Path, symbol: str) -> Path | None:
-    """First ``*.csv`` in ``data_dir`` whose file name starts with the symbol."""
+    """The CSV in ``data_dir`` for ``symbol``.
+
+    Matches ``USDCHF_M5.csv``, ``usdchf.csv`` and TradingView export names such
+    as ``FX_USDCHF, 5.csv`` or ``OANDA_USDCHF, 5.csv``.
+    """
     folder = Path(data_dir)
     if not folder.is_dir():
         return None
     symbol = normalize_symbol(symbol)
-    for p in sorted(folder.iterdir()):
-        if p.suffix.lower() != ".csv":
-            continue
+    files = sorted(p for p in folder.iterdir() if p.suffix.lower() == ".csv")
+    for p in files:
         stem = p.stem.upper().replace("_", "").replace("-", "").replace("/", "")
         if stem.startswith(symbol):
+            return p
+    pattern = re.compile(rf"(?<![A-Z]){symbol}(?![A-Z])")
+    for p in files:
+        if pattern.search(p.stem.upper()):
             return p
     return None
 

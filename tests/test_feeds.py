@@ -18,9 +18,10 @@ UTC = timezone.utc
 
 
 class FakeResponse:
-    def __init__(self, payload, status=200):
+    def __init__(self, payload, status=200, content=b""):
         self.payload = payload
         self.status_code = status
+        self.content = content
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -82,7 +83,9 @@ def test_yahoo_parses_and_returns_only_closed_aligned_bars():
 
 def test_yahoo_errors_become_feed_errors():
     with pytest.raises(FeedError):
-        YahooFeed(5, session=FakeSession({}, status=500)).fetch_closed("USDCHF", 10, datetime.now(UTC))
+        YahooFeed(5, session=FakeSession({}, status=500), sleep=lambda s: None).fetch_closed(
+            "USDCHF", 10, datetime.now(UTC)
+        )
     with pytest.raises(FeedError):
         YahooFeed.parse({"chart": {"error": {"code": "Not Found"}}}, 5)
 
@@ -168,7 +171,7 @@ def test_csv_naive_times_across_dst_fall_back(tmp_path):
 
 def test_yahoo_waits_for_bar_to_settle():
     start = datetime(2026, 1, 6, 21, 0, tzinfo=UTC)
-    feed = YahooFeed(5, session=FakeSession(yahoo_payload(int(start.timestamp()))))
+    feed = YahooFeed(5, session=FakeSession(yahoo_payload(int(start.timestamp()))), sleep=lambda s: None)
     just_closed = start + timedelta(minutes=15, seconds=3)  # 21:10 bar closed 3s ago
     assert [b.time for b in feed.fetch_closed("USDCHF", 10, just_closed)][-1] == start
     later = start + timedelta(minutes=15, seconds=15)
@@ -214,3 +217,127 @@ def test_oanda_stops_when_history_runs_out():
     now = bars[-1].time + timedelta(minutes=5)
     got = OandaFeed(5, token="x", session=FakeOanda(bars, now)).fetch_closed("USDCHF", 9_000, now)
     assert got == bars
+
+
+class ScriptedSession:
+    """Plays back a list of responses (or exceptions), recording each URL."""
+
+    def __init__(self, script):
+        self.script, self.urls, self.headers = list(script), [], {}
+
+    def get(self, url, params=None, timeout=None):
+        self.urls.append(url)
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def test_yahoo_retries_429_on_the_other_host_then_succeeds():
+    start = datetime(2026, 1, 6, 21, 0, tzinfo=UTC)
+    ok = FakeResponse(yahoo_payload(int(start.timestamp())))
+    session = ScriptedSession([FakeResponse({}, 429), ConnectionError("reset"), ok])
+    waits = []
+    feed = YahooFeed(5, session=session, sleep=waits.append, min_interval_seconds=0)
+    bars = feed.fetch_closed("USDCHF", 10, start + timedelta(minutes=30))
+    assert len(bars) == 3  # the null row and the unaligned live tick are skipped
+    assert [u.split("/")[2] for u in session.urls] == [
+        "query1.finance.yahoo.com", "query2.finance.yahoo.com", "query1.finance.yahoo.com",
+    ]
+    assert waits == [3.0, 6.0]  # exponential backoff between tries
+
+
+def test_yahoo_gives_up_after_retries_and_does_not_retry_404():
+    session = ScriptedSession([FakeResponse({}, 429)] * 4)
+    feed = YahooFeed(5, session=session, sleep=lambda s: None)
+    with pytest.raises(FeedError, match="after 4 tries: HTTP 429 Too Many Requests"):
+        feed.fetch_closed("USDCHF", 10, datetime.now(UTC))
+    session = ScriptedSession([FakeResponse({}, 404)])
+    with pytest.raises(FeedError, match="HTTP 404"):
+        YahooFeed(5, session=session, sleep=lambda s: None).fetch_closed("USDCHF", 10, datetime.now(UTC))
+    assert len(session.urls) == 1
+
+
+def test_browser_session_falls_back_to_requests_with_browser_headers(monkeypatch):
+    import sys
+
+    from scalper.feeds import browser_session
+
+    monkeypatch.setitem(sys.modules, "curl_cffi", None)  # simulate "not installed"
+    session = browser_session()
+    assert session.headers["User-Agent"].startswith("Mozilla/5.0 (Windows NT 10.0")
+
+
+# ---- Dukascopy ------------------------------------------------------------
+import lzma  # noqa: E402
+import struct  # noqa: E402
+
+from scalper.feeds import DukascopyFeed, aggregate  # noqa: E402
+
+
+def bi5(records):
+    raw = b"".join(struct.pack(">5if", *r) for r in records)
+    return lzma.compress(raw, format=lzma.FORMAT_ALONE)
+
+
+def test_dukascopy_decodes_minutes_and_builds_five_minute_bars():
+    # 09:00-09:09 on 6 Jan 2026; fields are open, close, low, high in points.
+    records = []
+    for i in range(10):
+        o = 88000 + i
+        records.append((9 * 3600 + 60 * i, o, o + 1, o - 2, o + 3, 1.5))
+    records.append((9 * 3600 + 600, 1, 1, 1, 1, 0.0))  # no volume: market closed, dropped
+    day = datetime(2026, 1, 6, tzinfo=UTC)
+    minutes = DukascopyFeed.decode(bi5(records), day, 100_000, "USDCHF")
+    assert len(minutes) == 10
+    assert minutes[0] == Bar(day + timedelta(hours=9), 0.88, 0.88003, 0.87998, 0.88001)
+    bars = aggregate(minutes, 5)
+    assert [b.time.minute for b in bars] == [0, 5]
+    assert bars[0].open == pytest.approx(0.88) and bars[0].close == pytest.approx(0.88005)
+    assert bars[0].high == pytest.approx(0.88007) and bars[0].low == pytest.approx(0.87998)
+
+
+def test_dukascopy_rejects_garbled_files():
+    day = datetime(2026, 1, 6, tzinfo=UTC)
+    with pytest.raises(FeedError, match="out of order"):
+        DukascopyFeed.decode(bi5([(0, 100, 101, 105, 99, 1.0)]), day, 100_000)  # low above high
+    with pytest.raises(FeedError, match="LZMA"):
+        DukascopyFeed.decode(b"<html>blocked</html>", day, 100_000)
+
+
+def test_dukascopy_fetch_walks_days_with_zero_based_months():
+    now = datetime(2026, 2, 2, 12, 0, tzinfo=UTC)
+    files = {}
+    for d in (31, 1, 2):  # 31 Jan, 1 Feb (Sunday, no file), 2 Feb
+        month = 0 if d == 31 else 1
+        if d == 1:
+            continue
+        files[f"2026/{month:02d}/{d:02d}"] = bi5(
+            [(60 * i, 170000 + i, 170000 + i, 169990 + i, 170010 + i, 2.0) for i in range(0, 600)]
+        )
+
+    class DaySession:
+        headers = {}
+        urls = []
+
+        def get(self, url, params=None, timeout=None):
+            self.urls.append(url)
+            key = "/".join(url.split("/")[-4:-1])
+            return FakeResponse({}, 200, files[key]) if key in files else FakeResponse({}, 404)
+
+    session = DaySession()
+    feed = DukascopyFeed(5, session=session, sleep=lambda s: None)
+    bars = feed.fetch_closed("CHFJPY", 5000, now)
+    assert any("/CHFJPY/2026/00/31/BID_candles_min_1.bi5" in u for u in session.urls)
+    assert bars[0].time == datetime(2026, 1, 31, tzinfo=UTC)
+    assert bars[0].open == pytest.approx(170.0)  # JPY pairs use 0.001 points
+    assert bars[-1].time == datetime(2026, 2, 2, 9, 55, tzinfo=UTC)
+    assert len(bars) == 240
+
+
+def test_find_csv_accepts_tradingview_export_names(tmp_path):
+    for name in ("FX_USDCHF, 5.csv", "OANDA_CHFJPY, 5.csv", "notes.txt", "EURUSDCHF.csv"):
+        (tmp_path / name).write_text("time,open,high,low,close\n")
+    assert find_csv(tmp_path, "USDCHF").name == "FX_USDCHF, 5.csv"
+    assert find_csv(tmp_path, "CHFJPY").name == "OANDA_CHFJPY, 5.csv"
+    assert find_csv(tmp_path, "AUDCAD") is None

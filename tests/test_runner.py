@@ -134,8 +134,7 @@ class FakeYahoo:
         }
 
         class Resp:
-            def raise_for_status(self):
-                pass
+            status_code = 200
 
             def json(self):
                 return payload
@@ -154,7 +153,7 @@ def test_live_loop_through_yahoo_feed_matches_replay(tmp_path, data):
     expected = read_trades(tmp_path / "replay" / "paper_trades.csv")
 
     clock = SimClock(start)
-    feed = YahooFeed(5, session=FakeYahoo(data, clock))
+    feed = YahooFeed(5, session=FakeYahoo(data, clock), min_interval_seconds=0, sleep=lambda s: None)
     PaperTrader(cfg, feed, clock, tmp_path / "yahoo").run(max_cycles=cycles)
     got = read_trades(tmp_path / "yahoo" / "paper_trades.csv")
 
