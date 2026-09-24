@@ -1,10 +1,17 @@
-"""Pine-style session windows such as ``"1600-1900"`` or ``"2200-0100:23456"``."""
+"""Pine-style session windows such as ``"1600-1900"`` or ``"2200-0100:23456"``.
+
+A session without a day list follows Pine v4 (the version of the .pine file)
+and covers Monday to Friday only. Pine v5 changed that default to all seven
+days; write ``"1600-1900:1234567"`` to get the v5 behaviour.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
+
+PINE_V4_DEFAULT_DAYS = frozenset({2, 3, 4, 5, 6})  # Monday..Friday
 
 
 @dataclass(frozen=True)
@@ -17,7 +24,7 @@ class SessionWindow:
     @classmethod
     def parse(cls, spec: str, tz_name: str) -> SessionWindow:
         spec = spec.strip()
-        days = frozenset(range(1, 8))
+        days = PINE_V4_DEFAULT_DAYS
         if ":" in spec:
             spec, day_part = spec.split(":", 1)
             if not day_part.isdigit() or not set(day_part) <= set("1234567"):

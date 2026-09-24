@@ -22,7 +22,7 @@ def data():
 def config(history=400):
     cfg = no_cost_config(symbols=list(SYMBOLS))
     cfg.feed.history_bars = history
-    cfg.feed.poll_delay_seconds = 5
+    cfg.feed.poll_delay_seconds = 15
     return cfg
 
 
@@ -50,7 +50,7 @@ def test_replay_matches_direct_engine_run(tmp_path, data):
     start = feed.start_time(cfg.feed.history_bars)
     engine = build_engine(cfg)
     stream = sorted(
-        ((b.time, 0 if s in AUX else 1, s, b) for s, bars in data.items() for b in bars),
+        ((b.time, engine.sort_rank(s), s, b) for s, bars in data.items() for b in bars),
         key=lambda x: x[:3],
     )
     for t, _, s, b in stream:
@@ -212,3 +212,104 @@ def test_exits_missed_during_outage_still_replayed_if_startup_fetch_fails(tmp_pa
     want = next(t for t in straight if t.symbol == symbol and t.entry_time == pos.entry_time)
     assert pos.id in got, "the open position was never closed"
     assert (got[pos.id].exit_time, got[pos.id].exit_reason) == (want.exit_time, want.exit_reason)
+
+
+class LaggingFeed:
+    """Wraps a feed and leaves out the newest bar on the first request per symbol."""
+
+    def __init__(self, inner):
+        self.inner, self.seen = inner, set()
+
+    def fetch_closed(self, symbol, count, now):
+        bars = self.inner.fetch_closed(symbol, count, now)
+        if symbol not in self.seen:
+            self.seen.add(symbol)
+            return bars[:-1]
+        return bars
+
+
+def run_until(trader, predicate, limit=6000):
+    for _ in range(limit):
+        trader._sleep_until_next_bar()
+        trader.cycle()
+        if predicate():
+            return
+    raise AssertionError("condition never reached")
+
+
+def test_lagging_startup_fetch_cannot_fill_order_on_its_signal_bar(tmp_path, data):
+    cfg = config()
+    feed = ReplayFeed(data, cfg.timeframe_minutes)
+    clock = SimClock(feed.start_time(cfg.feed.history_bars))
+    first = PaperTrader(cfg, feed, clock, tmp_path)
+    first.bootstrap()
+    run_until(first, lambda: bool(first.engine.broker.pending))
+    symbol, order = next(iter(first.engine.broker.pending.items()))
+
+    # Restart straight away; the first fetch misses the signal bar.
+    second = PaperTrader(cfg, LaggingFeed(ReplayFeed(data, 5)), SimClock(clock.now()), tmp_path)
+    second.bootstrap()
+    assert second.store.load()["last_bar_time"][symbol] == order.signal_time.isoformat()
+    second._sleep_until_next_bar()
+    second.cycle()
+
+    pos = second.engine.broker.positions.get(symbol)
+    entry_time = pos.entry_time if pos else next(
+        t.entry_time for t in second.engine.broker.trades if t.symbol == symbol
+    )
+    assert entry_time == order.signal_time + timedelta(minutes=5)
+
+
+class Crash(Exception):
+    pass
+
+
+def test_crash_between_journal_and_state_write_does_not_duplicate(tmp_path, data):
+    cfg = config()
+    replay(cfg, data, tmp_path / "straight")
+    straight = read_trades(tmp_path / "straight" / "paper_trades.csv")
+
+    feed = ReplayFeed(data, cfg.timeframe_minutes)
+    clock = SimClock(feed.start_time(cfg.feed.history_bars))
+    trader = PaperTrader(cfg, feed, clock, tmp_path / "crashy")
+    real_save = trader.store.save
+    seen = {"outbox": False}
+
+    def save_then_maybe_crash(state):
+        # Die on the save that follows a journal write, i.e. after the trade
+        # reached the journal but before the account knows it was written.
+        if seen["outbox"] and not state["outbox"]:
+            raise Crash
+        seen["outbox"] = bool(state["outbox"])
+        real_save(state)
+
+    trader.store.save = save_then_maybe_crash
+    with pytest.raises(Crash):
+        trader.run()
+    written = read_trades(tmp_path / "crashy" / "paper_trades.csv")
+    assert written, "the crash should come after at least one journal write"
+
+    resumed = PaperTrader(cfg, ReplayFeed(data, 5), SimClock(clock.now()), tmp_path / "crashy")
+    resumed.run()
+    journal = read_trades(tmp_path / "crashy" / "paper_trades.csv")
+    assert len({t.id for t in journal}) == len(journal)
+    assert trade_keys(journal) == trade_keys(straight)
+
+
+def test_refuses_to_start_with_trades_in_removed_symbol(tmp_path, data):
+    from scalper.config import ConfigError
+
+    cfg = config()
+    feed = ReplayFeed(data, cfg.timeframe_minutes)
+    clock = SimClock(feed.start_time(cfg.feed.history_bars))
+    first = PaperTrader(cfg, feed, clock, tmp_path)
+    first.bootstrap()
+    run_until(first, lambda: bool(first.engine.broker.positions))
+    first._save()
+    symbol = next(iter(first.engine.broker.positions))
+
+    trimmed = config()
+    trimmed.symbols = [s for s in SYMBOLS if s != symbol]
+    trimmed.validate()
+    with pytest.raises(ConfigError, match=symbol):
+        PaperTrader(trimmed, ReplayFeed(data, 5), SimClock(clock.now()), tmp_path).bootstrap()

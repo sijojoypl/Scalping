@@ -80,7 +80,7 @@ Replays (`csv`, `synthetic`) write to `state/replay-<provider>/`, so they never 
 | `rsi` from `rma` of up/down moves, length 20; `sma(rsi, 5)` | `indicators.RSI`, `indicators.SMA` (Wilder smoothing seeded with an SMA, like Pine) |
 | long: `crossunder(rsi_ma, 49)`; short: `crossover(rsi_ma, 55)` | `strategy.ReverseRSIStrategy`                  |
 | EMA ribbon 4/10/15/19/25, fully stacked                  | same; long needs `close < ema4 < ... < ema25`         |
-| session `1600-1900` in exchange time                     | `session: "1600-1900"`, `session_timezone: America/New_York` (TradingView's timezone for FXCM/OANDA forex) |
+| session `1600-1900` in exchange time                     | `session: "1600-1900"`, `session_timezone: America/New_York` (TradingView's timezone for FXCM/OANDA forex). Monday to Friday only, because Pine v4 sessions default to weekdays; this skips the Sunday weekly open. |
 | `posSize = capital * 1% / (ATR*2*SLmult) / quoteUSD`     | `engine.Engine._on_signal`, rounded like Pine's `round`. Pine takes the quote currency's USD rate from the previous daily close; the bot uses the latest 5-minute close. |
 | SL/TP from the signal bar's close, TP = 1.5x stop        | same                                                  |
 | one position per pair (`position_size == 0`)             | same                                                  |
@@ -111,6 +111,8 @@ These follow TradingView's broker emulator so a paper session and a TradingView 
 ### Restarts and downtime
 
 On restart the bot replays the bars it missed. Stops and targets that were hit while it was off get booked where they would have filled, since resting orders at a broker would have filled too. It does not open new trades on signals older than two bars.
+
+If you remove a pair from `symbols` while the account still has a trade open in it, the bot refuses to start and tells you. Add the pair back until the trade closes, or reset the account.
 
 To run it from a scheduler instead of leaving it open, call `python -m scalper paper --once` every 5 minutes. Each call processes the new bars and exits.
 

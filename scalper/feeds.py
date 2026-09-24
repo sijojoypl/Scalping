@@ -46,9 +46,18 @@ class YahooFeed:
     INTERVALS = {1: "1m", 5: "5m", 15: "15m", 30: "30m", 60: "60m"}
     MAX_DAYS = {1: 7, 5: 59, 15: 59, 30: 59, 60: 700}
 
-    def __init__(self, timeframe_minutes: int, timeout: float = 20.0, session: requests.Session | None = None):
+    def __init__(
+        self,
+        timeframe_minutes: int,
+        timeout: float = 20.0,
+        session: requests.Session | None = None,
+        settle_seconds: float = 10.0,
+    ):
         self.tf_minutes = timeframe_minutes
         self.tf = timedelta(minutes=timeframe_minutes)
+        # Yahoo has no "complete" flag and keeps updating a bar for a few
+        # seconds after it closes, so wait this long before trusting it.
+        self.settle = timedelta(seconds=settle_seconds)
         self.timeout = timeout
         self.session = session or requests.Session()
         self.session.headers.setdefault("User-Agent", "Mozilla/5.0 (reverse-rsi-paper-bot)")
@@ -75,7 +84,7 @@ class YahooFeed:
             bars = self.parse(payload, self.tf_minutes)
         except (KeyError, TypeError, IndexError, ValueError, AttributeError) as exc:
             raise FeedError(f"unexpected Yahoo response for {symbol}: {exc!r}") from exc
-        return [b for b in bars if is_closed(b.time, self.tf, now)][-count:]
+        return [b for b in bars if is_closed(b.time, self.tf + self.settle, now)][-count:]
 
     @staticmethod
     def parse(payload: dict, tf_minutes: int) -> list[Bar]:
@@ -214,7 +223,8 @@ _TIME_FORMATS = (
 )
 
 
-def _parse_time(raw: str, tz: ZoneInfo) -> datetime:
+def _parse_raw(raw: str) -> datetime:
+    """Parse a CSV timestamp. Returns an aware datetime, or a naive one if the text has no zone."""
     raw = raw.strip()
     if raw.replace(".", "", 1).isdigit():
         value = float(raw)
@@ -224,21 +234,31 @@ def _parse_time(raw: str, tz: ZoneInfo) -> datetime:
     cleaned = raw.replace(" GMT", "").replace(" UTC", "")
     if cleaned.endswith("Z"):
         cleaned = cleaned[:-1] + "+00:00"
-    dt: datetime | None = None
     try:
-        dt = datetime.fromisoformat(cleaned)
+        return datetime.fromisoformat(cleaned)
     except ValueError:
-        for fmt in _TIME_FORMATS:
-            try:
-                dt = datetime.strptime(cleaned, fmt)
-                break
-            except ValueError:
-                continue
-    if dt is None:
-        raise ValueError(f"unrecognised timestamp: {raw!r}")
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=tz)
-    return dt.astimezone(timezone.utc)
+        pass
+    for fmt in _TIME_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"unrecognised timestamp: {raw!r}")
+
+
+def _localize(naive: datetime, tz: ZoneInfo, prev_utc: datetime | None) -> datetime:
+    """Attach ``tz`` to a naive local time.
+
+    In the repeated hour after a DST fall-back the same wall time happens
+    twice. Rows arrive in order, so when the first reading would step back in
+    time, the row belongs to the second pass (``fold=1``).
+    """
+    aware = naive.replace(tzinfo=tz)
+    if prev_utc is not None and aware.astimezone(timezone.utc) <= prev_utc:
+        second = naive.replace(tzinfo=tz, fold=1)
+        if second.astimezone(timezone.utc) > prev_utc:
+            return second
+    return aware
 
 
 def load_csv(path: str | Path, tz_name: str = "UTC") -> list[Bar]:
@@ -265,11 +285,16 @@ def load_csv(path: str | Path, tz_name: str = "UTC") -> list[Bar]:
         if time_idx is None:
             raise ValueError(f"{path}: no time column found; header was {header}")
         bars: dict[datetime, Bar] = {}
+        prev: datetime | None = None
         for row in reader:
             if not row or not any(cell.strip() for cell in row):
                 continue
             raw_time = f"{row[col['date']]} {row[col['time']]}" if split_date_time else row[time_idx]
-            t = _parse_time(raw_time, tz)
+            dt = _parse_raw(raw_time)
+            if dt.tzinfo is None:
+                dt = _localize(dt, tz, prev)
+            t = dt.astimezone(timezone.utc)
+            prev = t
             o, h, l, c = (float(row[col[k]]) for k in ("open", "high", "low", "close"))
             if any(math.isnan(v) for v in (o, h, l, c)):
                 continue

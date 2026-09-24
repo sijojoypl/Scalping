@@ -34,11 +34,23 @@ class StateStore:
         os.replace(tmp, self.path)  # atomic, so a crash never leaves half a file
 
 
+def _trade_key(t: Trade) -> tuple:
+    return (t.id, t.symbol, t.entry_time.isoformat(), t.exit_time.isoformat())
+
+
 class TradeJournal:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self._keys: set[tuple] | None = None
 
-    def append(self, trade: Trade) -> None:
+    def append(self, trade: Trade) -> bool:
+        """Append a closed trade; returns False if the journal already has it."""
+        if self._keys is None:
+            self._keys = {_trade_key(t) for t in self.read()}
+        key = _trade_key(trade)
+        if key in self._keys:
+            return False
+        self._keys.add(key)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         new_file = not self.path.exists() or self.path.stat().st_size == 0
         with self.path.open("a", encoding="utf-8", newline="") as fh:
@@ -46,6 +58,7 @@ class TradeJournal:
             if new_file:
                 writer.writeheader()
             writer.writerow(to_dict(trade))
+        return True
 
     def read(self) -> list[Trade]:
         return read_trades(self.path)

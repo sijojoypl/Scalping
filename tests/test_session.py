@@ -39,3 +39,12 @@ def test_overnight_session_and_days():
 def test_bad_sessions_rejected(bad):
     with pytest.raises(ValueError):
         SessionWindow.parse(bad, "UTC")
+
+
+def test_default_days_follow_pine_v4_weekdays():
+    # 17:00 New York on Sunday 4 Jan 2026 (the weekly open) is 22:00 UTC.
+    assert not NY.contains(datetime(2026, 1, 4, 22, 0, tzinfo=UTC))
+    assert NY.contains(datetime(2026, 1, 5, 22, 0, tzinfo=UTC))  # Monday
+    assert NY.contains(datetime(2026, 1, 9, 21, 0, tzinfo=UTC))  # Friday 16:00 NY
+    every_day = SessionWindow.parse("1600-1900:1234567", "America/New_York")
+    assert every_day.contains(datetime(2026, 1, 4, 22, 0, tzinfo=UTC))

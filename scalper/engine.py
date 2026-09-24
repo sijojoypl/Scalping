@@ -54,6 +54,11 @@ class Engine:
     def is_aux(self, symbol: str) -> bool:
         return symbol not in self.strategies
 
+    def sort_rank(self, symbol: str) -> int:
+        """Bars sharing a timestamp go USD pairs first, so crosses convert at the fresh rate."""
+        cur = self.config.account.currency
+        return 0 if symbol.startswith(cur) or symbol.endswith(cur) else 1
+
     # ------------------------------------------------------------------ bars
     def warmup(self, symbol: str, bar: Bar) -> None:
         """Feed history through the indicators without trading."""

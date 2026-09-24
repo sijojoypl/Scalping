@@ -14,7 +14,7 @@ strategy:                     # Pine inputs, same defaults as the .pine file
   upper_limit: 55             # short when RSI SMA crosses above this...
   lower_limit: 49             # ...long when it crosses below this
   ema_lengths: [4, 10, 15, 19, 25]
-  session: "1600-1900"        # quiet hours, Sydney session
+  session: "1600-1900"        # quiet hours, Sydney session; Mon-Fri like Pine v4 (":1234567" = every day)
   session_timezone: America/New_York   # timezone TradingView uses for FXCM/OANDA forex
   atr_length: 14
   atr_mult: 2.0

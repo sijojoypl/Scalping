@@ -22,11 +22,11 @@ class BacktestResult:
     bars_processed: int
 
 
-def merged_stream(bars_by_symbol: dict[str, list[Bar]], aux: set[str]):
-    """Yield ``(symbol, bar)`` in time order; conversion pairs go first on ties."""
+def merged_stream(bars_by_symbol: dict[str, list[Bar]], first: set[str]):
+    """Yield ``(symbol, bar)`` in time order; symbols in ``first`` lead on ties."""
 
     def keyed(symbol: str, bars: list[Bar]):
-        rank = 0 if symbol in aux else 1
+        rank = 0 if symbol in first else 1
         return ((b.time, rank, symbol, b) for b in bars)
 
     iterables = [keyed(s, bars) for s, bars in bars_by_symbol.items()]
@@ -50,7 +50,8 @@ def run_backtest(config: Config, bars_by_symbol: dict[str, list[Bar]]) -> Backte
     wanted = set(config.symbols) | set(engine.aux_symbols)
     data = {s: sorted(b, key=lambda x: x.time) for s, b in bars_by_symbol.items() if s in wanted}
     count = 0
-    for symbol, bar in merged_stream(data, set(engine.aux_symbols)):
+    usd_pairs = {s for s in data if engine.sort_rank(s) == 0}
+    for symbol, bar in merged_stream(data, usd_pairs):
         engine.on_bar(symbol, bar)
         count += 1
     trades = list(engine.broker.trades)

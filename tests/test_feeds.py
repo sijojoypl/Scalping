@@ -149,3 +149,27 @@ def test_synthetic_data_skips_the_weekend():
     assert not any(b.time.weekday() == 5 for b in bars)  # no Saturday bars
     gaps = [b.time - a.time for a, b in zip(bars, bars[1:])]
     assert max(gaps) >= timedelta(hours=40)
+
+
+def test_csv_naive_times_across_dst_fall_back(tmp_path):
+    # New York falls back on 1 Nov 2026: 01:00-01:55 local happens twice.
+    wall = [f"2026-11-01 00:{m:02d}" for m in range(0, 60, 5)]
+    wall += [f"2026-11-01 01:{m:02d}" for m in range(0, 60, 5)] * 2
+    wall += [f"2026-11-01 02:{m:02d}" for m in range(0, 60, 5)]
+    rows = "\n".join(f"{w},1,1,1,1" for w in wall)
+    p = tmp_path / "EURUSD.csv"
+    p.write_text("time,open,high,low,close\n" + rows + "\n")
+    bars = load_csv(p, "America/New_York")
+    assert len(bars) == 48
+    assert bars[0].time == datetime(2026, 11, 1, 4, 0, tzinfo=UTC)  # 00:00 EDT
+    steps = {b.time - a.time for a, b in zip(bars, bars[1:])}
+    assert steps == {timedelta(minutes=5)}
+
+
+def test_yahoo_waits_for_bar_to_settle():
+    start = datetime(2026, 1, 6, 21, 0, tzinfo=UTC)
+    feed = YahooFeed(5, session=FakeSession(yahoo_payload(int(start.timestamp()))))
+    just_closed = start + timedelta(minutes=15, seconds=3)  # 21:10 bar closed 3s ago
+    assert [b.time for b in feed.fetch_closed("USDCHF", 10, just_closed)][-1] == start
+    later = start + timedelta(minutes=15, seconds=15)
+    assert [b.time for b in feed.fetch_closed("USDCHF", 10, later)][-1] == start + timedelta(minutes=10)
