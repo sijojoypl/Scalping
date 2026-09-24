@@ -133,3 +133,21 @@ def test_no_cost_backtest_has_one_to_one_point_five_payoff():
         target = 750 if t.exit_reason == "TP" else -500
         assert t.pnl == pytest.approx(target, rel=0.03), t
         assert t.side in (Side.LONG, Side.SHORT)
+
+
+def test_backtest_window_only_trades_after_start():
+    cfg = no_cost_config()
+    data = generate_synthetic(cfg.symbols + ["USDJPY", "USDCAD", "AUDUSD"], days=40, seed=7)
+    last = max(bars[-1].time for bars in data.values())
+    start = last - timedelta(days=30)
+    full = run_backtest(cfg, data)
+    window = run_backtest(cfg, data, start=start)
+    assert window.trades and window.warmup_bars > 0
+    assert min(t.entry_time for t in window.trades) > start
+    # Same rules as the full run once both are flat: every windowed trade that
+    # starts after the full run's last pre-window trade closed is identical.
+    settled = max((t.exit_time for t in full.trades if t.entry_time <= start), default=start)
+    key = lambda t: (t.symbol, t.entry_time, t.exit_time, t.exit_reason, t.qty)  # noqa: E731
+    later_full = [key(t) for t in full.trades if t.entry_time > settled]
+    later_window = [key(t) for t in window.trades if t.entry_time > settled]
+    assert later_window == later_full

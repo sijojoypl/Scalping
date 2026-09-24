@@ -173,3 +173,44 @@ def test_yahoo_waits_for_bar_to_settle():
     assert [b.time for b in feed.fetch_closed("USDCHF", 10, just_closed)][-1] == start
     later = start + timedelta(minutes=15, seconds=15)
     assert [b.time for b in feed.fetch_closed("USDCHF", 10, later)][-1] == start + timedelta(minutes=10)
+
+
+class FakeOanda:
+    """Serves synthetic candles the way OANDA does: at most 5000, newest last, ``to`` exclusive."""
+
+    def __init__(self, bars, now):
+        self.bars, self.now, self.headers, self.calls = bars, now, {}, []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(dict(params))
+        assert params["count"] <= 5000
+        to = params.get("to")
+        limit = datetime.fromisoformat(to.replace("Z", "+00:00")) if to else self.now
+        rows = [b for b in self.bars if b.time < limit][-params["count"]:]
+        candles = [
+            {
+                "complete": b.time + timedelta(minutes=5) <= self.now,
+                "time": b.time.strftime("%Y-%m-%dT%H:%M:%S.000000000Z"),
+                "mid": {"o": str(b.open), "h": str(b.high), "l": str(b.low), "c": str(b.close)},
+            }
+            for b in rows
+        ]
+        return FakeResponse({"candles": candles})
+
+
+def test_oanda_pages_back_past_5000_candles():
+    bars = generate_synthetic(["USDCHF"], days=60, seed=3)["USDCHF"]
+    now = bars[-1].time + timedelta(minutes=2)  # last bar still forming
+    session = FakeOanda(bars, now)
+    got = OandaFeed(5, token="x", session=session).fetch_closed("USDCHF", 12_000, now)
+    closed = [b for b in bars if b.time + timedelta(minutes=5) <= now]
+    assert [b.time for b in got] == [b.time for b in closed[-12_000:]]
+    assert len(session.calls) == 3
+    assert "to" not in session.calls[0] and "to" in session.calls[1]
+
+
+def test_oanda_stops_when_history_runs_out():
+    bars = generate_synthetic(["USDCHF"], days=3, seed=3)["USDCHF"]
+    now = bars[-1].time + timedelta(minutes=5)
+    got = OandaFeed(5, token="x", session=FakeOanda(bars, now)).fetch_closed("USDCHF", 9_000, now)
+    assert got == bars

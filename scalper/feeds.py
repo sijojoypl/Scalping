@@ -146,10 +146,31 @@ class OandaFeed:
     def from_env(cls, timeframe_minutes: int, token_env: str, environment: str, timeout: float) -> OandaFeed:
         return cls(timeframe_minutes, os.environ.get(token_env, ""), environment, timeout)
 
+    MAX_PER_REQUEST = 5000
+
     def fetch_closed(self, symbol: str, count: int, now: datetime) -> list[Bar]:
+        """Newest ``count`` complete candles, paging backwards 5000 at a time."""
         inst = Instrument.from_symbol(symbol)
         url = f"{self.host}/v3/instruments/{inst.base}_{inst.quote}/candles"
-        params = {"granularity": self.GRANULARITY[self.tf_minutes], "count": min(count + 1, 5000), "price": "M"}
+        found: dict[datetime, Bar] = {}
+        before: datetime | None = None
+        while len(found) < count:
+            want = min(count - len(found) + 1, self.MAX_PER_REQUEST)
+            params = {"granularity": self.GRANULARITY[self.tf_minutes], "count": want, "price": "M"}
+            if before is not None:
+                params["to"] = before.strftime("%Y-%m-%dT%H:%M:%SZ")
+            chunk = self._get(url, params, symbol)
+            older = [b for b in chunk if before is None or b.time < before]
+            if not older:
+                break
+            found.update((b.time, b) for b in older)
+            before = older[0].time
+            if len(chunk) < want - 1:  # the broker has no more history
+                break
+        bars = [found[t] for t in sorted(found)]
+        return [b for b in bars if is_closed(b.time, self.tf, now)][-count:]
+
+    def _get(self, url: str, params: dict, symbol: str) -> list[Bar]:
         try:
             resp = self.session.get(url, params=params, timeout=self.timeout)
             resp.raise_for_status()
@@ -157,10 +178,9 @@ class OandaFeed:
         except (requests.RequestException, ValueError) as exc:
             raise FeedError(f"OANDA request for {symbol} failed: {exc}") from exc
         try:
-            bars = self.parse(payload)
+            return self.parse(payload)
         except (KeyError, TypeError, IndexError, ValueError, AttributeError) as exc:
             raise FeedError(f"unexpected OANDA response for {symbol}: {exc!r}") from exc
-        return [b for b in bars if is_closed(b.time, self.tf, now)][-count:]
 
     @staticmethod
     def parse(payload: dict) -> list[Bar]:

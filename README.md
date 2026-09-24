@@ -48,17 +48,24 @@ Synthetic prices are random walks. They exercise the plumbing, and their P&L tel
 
 ### Backtesting on real data
 
-Put one CSV per pair in `data/`, named after the pair (`data/USDCHF_M5.csv`, `data/CHFJPY.csv`, and so on). TradingView exports, MT4/MT5 exports, Dukascopy downloads and ISO-timestamp files all load. Then:
+A one-month backtest on real prices takes two commands:
 
 ```bash
-python -m scalper backtest                 # with the spreads from config/paper.yaml
-python -m scalper backtest --no-costs      # zero costs, like the TradingView results above
-python -m scalper backtest --trades-out trades.csv
+python -m scalper fetch                 # last 45 days of M5 candles into data/ (Yahoo, or OANDA if configured)
+python -m scalper backtest --days 30    # trade the last 30 days; the 15 days before warm up the indicators
 ```
 
-For the cross pairs, also add the USD pair that prices the quote currency: `USDJPY` for CHFJPY, `USDCAD` for AUDCAD, `AUDUSD` for GBPAUD. Without those files the bot falls back to the fixed rates in `fx_fallback_rates`.
+Useful variations:
 
-`python -m scalper fetch` downloads recent candles from the live feed into `data/`. Yahoo keeps about 60 days of 5-minute history, and OANDA returns up to 5000 bars per request.
+```bash
+python -m scalper backtest --days 30 --no-costs     # zero costs, like the TradingView results above
+python -m scalper backtest --days 30 --trades-out trades.csv
+python -m scalper backtest --days 30 --log-level INFO   # print every signal, fill and exit
+```
+
+Without `--days` the backtest uses every bar in `data/`. Yahoo keeps about 59 days of 5-minute history, so `fetch --days 59` is the most it can give. OANDA goes back further; the bot pages through its 5000-candle limit.
+
+You can also drop in your own CSVs, one per pair, named after it (`data/USDCHF_M5.csv`, `data/CHFJPY.csv`, ...). TradingView exports, MT4/MT5 exports, Dukascopy downloads and ISO-timestamp files all load. For the cross pairs, also add the USD pair that prices the quote currency: `USDJPY` for CHFJPY, `USDCAD` for AUDCAD, `AUDUSD` for GBPAUD. Without those files the bot falls back to the fixed rates in `fx_fallback_rates`. `fetch` downloads them automatically.
 
 ### Data feeds
 

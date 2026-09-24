@@ -7,7 +7,7 @@ import logging
 import logging.handlers
 import shutil
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from scalper.clock import RealClock, SimClock
@@ -131,18 +131,39 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     setup_logging(args.log_level or "WARNING")
 
     if args.synthetic:
-        data = generate_synthetic(_symbols_with_aux(cfg), args.days, args.seed, cfg.timeframe_minutes)
-        source = f"synthetic data ({args.days} days, seed {args.seed})"
+        total_days = (args.days or 60) + (5 if args.days else 0)  # a few extra days to warm up
+        data = generate_synthetic(_symbols_with_aux(cfg), total_days, args.seed, cfg.timeframe_minutes)
+        source = f"synthetic data (seed {args.seed})"
     else:
         data_dir = args.data_dir or cfg.feed.data_dir
         data = load_csv_dir(data_dir, _symbols_with_aux(cfg), args.csv_tz or cfg.feed.csv_timezone)
+        if not any(data.get(s) for s in cfg.symbols):
+            raise ConfigError(
+                f"no CSV data in {data_dir!r}. Download some with: python -m scalper fetch"
+            )
         source = f"CSV files in {data_dir}"
 
-    result = run_backtest(cfg, data)
-    first = min(b[0].time for s, b in data.items() if s in cfg.symbols and b)
-    last = max(b[-1].time for s, b in data.items() if s in cfg.symbols and b)
+    traded = [b for s, b in data.items() if s in cfg.symbols and b]
+    first = min(b[0].time for b in traded)
+    last = max(b[-1].time for b in traded)
+    start = None
+    if args.days:
+        start = last + timedelta(minutes=cfg.timeframe_minutes) - timedelta(days=args.days)
+        if start <= first:
+            print(
+                f"warning: data only covers {(last - first).days} day(s); "
+                f"testing all of it with no separate warm-up",
+                file=sys.stderr,
+            )
+            start = None
+    result = run_backtest(cfg, data, start)
+    window_start = start or first
     print(f"Backtest: {', '.join(cfg.symbols)} M{cfg.timeframe_minutes} on {source}")
-    print(f"Period  : {first:%Y-%m-%d %H:%M} -> {last:%Y-%m-%d %H:%M} UTC, {result.bars_processed:,} bars")
+    print(
+        f"Period  : {window_start:%Y-%m-%d %H:%M} -> {last:%Y-%m-%d %H:%M} UTC, "
+        f"{result.bars_processed:,} bars"
+        + (f" (+{result.warmup_bars:,} warm-up bars before)" if result.warmup_bars else "")
+    )
     print(format_stats(result.stats, cfg.account.currency))
     print(per_symbol_table(result.trades, cfg.account.initial_capital, cfg.account.currency))
     open_pos = result.engine.broker.positions
@@ -211,9 +232,11 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     now = datetime.now(timezone.utc)
     out = Path(args.out)
     status = 0
+    count = args.days * 1440 // cfg.timeframe_minutes
+    cutoff = now - timedelta(days=args.days)
     for symbol in _symbols_with_aux(cfg):
         try:
-            bars = feed.fetch_closed(symbol, args.bars, now)
+            bars = [b for b in feed.fetch_closed(symbol, count, now) if b.time >= cutoff]
         except FeedError as exc:
             log.error("%s", exc)
             status = 1
@@ -265,7 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--csv-tz", help="timezone of naive CSV timestamps (default feed.csv_timezone)")
     b.add_argument("--symbols", nargs="+", help="override the configured symbols")
     b.add_argument("--synthetic", action="store_true", help="use generated random-walk data")
-    b.add_argument("--days", type=int, default=60, help="synthetic days (default 60)")
+    b.add_argument("--days", type=int, help="test only the last N days; earlier bars warm up the indicators")
     b.add_argument("--seed", type=int, default=7, help="synthetic seed (default 7)")
     b.add_argument("--no-costs", action="store_true", help="zero spread/slippage/commission, like TradingView defaults")
     b.add_argument("--trades-out", help="write the trade list to this CSV")
@@ -279,7 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     f = sub.add_parser("fetch", help="download recent candles to CSV for backtesting")
     f.add_argument("--provider", choices=["yahoo", "oanda"], help="override feed.provider")
-    f.add_argument("--bars", type=int, default=5000, help="bars per symbol (default 5000)")
+    f.add_argument("--days", type=int, default=45, help="calendar days of history (default 45; Yahoo keeps ~59)")
     f.add_argument("--out", default="data", help="output folder (default data)")
     f.set_defaults(func=cmd_fetch)
 

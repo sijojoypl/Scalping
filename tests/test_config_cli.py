@@ -80,3 +80,33 @@ def test_cli_paper_refuses_live_mode(tmp_path, capsys):
 def test_cli_status_without_account(tmp_path, capsys):
     cfg = write_config(tmp_path)
     assert main(["-c", cfg, "status"]) == 1
+
+
+def test_cli_fetch_then_one_month_backtest(tmp_path, capsys, monkeypatch):
+    """The documented workflow: fetch ~45 days, then backtest the last 30."""
+    from datetime import datetime, timedelta, timezone
+
+    import scalper.cli as cli
+    from scalper.feeds import ReplayFeed, generate_synthetic
+
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    symbols = ["USDCHF", "CHFJPY", "AUDCAD", "GBPAUD", "USDJPY", "USDCAD", "AUDUSD"]
+    data = generate_synthetic(symbols, days=60, seed=5, start=now - timedelta(days=60))
+    monkeypatch.setattr(cli, "_live_feed", lambda cfg: ReplayFeed(data, 5))
+
+    out = tmp_path / "data"
+    assert main(["fetch", "--out", str(out)]) == 0
+    assert len(list(out.glob("*.csv"))) == 7
+    capsys.readouterr()
+
+    assert main(["backtest", "--data-dir", str(out), "--days", "30"]) == 0
+    text = capsys.readouterr().out
+    period = next(line for line in text.splitlines() if line.startswith("Period"))
+    first_day = datetime.strptime(period.split()[2], "%Y-%m-%d").date()
+    assert abs((now.date() - first_day).days - 30) <= 1
+    assert "warm-up bars before" in text and "Profit factor" in text
+
+
+def test_cli_backtest_without_data_explains_fetch(tmp_path, capsys):
+    assert main(["backtest", "--data-dir", str(tmp_path / "empty")]) == 2
+    assert "scalper fetch" in capsys.readouterr().err
