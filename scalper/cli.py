@@ -114,7 +114,7 @@ def _print_summary(cfg: Config, state_dir: Path) -> int:
     stats = compute_stats(trades, cfg.account.initial_capital)
     print("\nReplay result (closed trades)")
     print(format_stats(stats, cfg.account.currency))
-    print(per_symbol_table(trades, cfg.account.initial_capital, cfg.account.currency))
+    print(per_symbol_table(trades, cfg.account.initial_capital, cfg.account.currency, cfg.strategy.profit_multiple))
     return 0
 
 
@@ -166,7 +166,15 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         + (f" (+{result.warmup_bars:,} warm-up bars before)" if result.warmup_bars else "")
     )
     print(format_stats(result.stats, cfg.account.currency))
-    print(per_symbol_table(result.trades, cfg.account.initial_capital, cfg.account.currency))
+    print(
+        per_symbol_table(
+            result.trades,
+            cfg.account.initial_capital,
+            cfg.account.currency,
+            cfg.strategy.profit_multiple,
+            cfg.costs.spread_for,
+        )
+    )
     open_pos = result.engine.broker.positions
     if open_pos:
         print(f"  Still open at the end: {', '.join(open_pos)}")
@@ -210,7 +218,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     stats = compute_stats(trades, broker["initial_balance"])
     print(format_stats(stats, cur))
     if trades:
-        print(per_symbol_table(trades, broker["initial_balance"], cur))
+        print(per_symbol_table(trades, broker["initial_balance"], cur, cfg.strategy.profit_multiple))
         print(f"  Last {min(args.trades, len(trades))} trade(s):")
         for t in trades[-args.trades:]:
             print(

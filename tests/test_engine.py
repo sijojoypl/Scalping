@@ -151,3 +151,17 @@ def test_backtest_window_only_trades_after_start():
     later_full = [key(t) for t in full.trades if t.entry_time > settled]
     later_window = [key(t) for t in window.trades if t.entry_time > settled]
     assert later_window == later_full
+
+
+def test_report_shows_average_stop_and_spread_share():
+    from scalper.report import avg_stop_pips, per_symbol_table
+
+    cfg = no_cost_config(symbols=["USDCHF"])
+    data = generate_synthetic(["USDCHF"], days=30, seed=7)
+    trades = run_backtest(cfg, data).trades
+    risks = [abs(t.take_profit - t.stop_loss) / 2.5 / 0.0001 for t in trades]
+    assert avg_stop_pips(trades, 1.5) == pytest.approx(sum(risks) / len(risks))
+    table = per_symbol_table(trades, 50_000, "USD", 1.5, lambda s: 1.5)
+    row = table.splitlines()[1]
+    stop = avg_stop_pips(trades, 1.5)
+    assert f"{stop:.1f}p" in row and f"{1.5 / stop * 100:.0f}%" in row

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
+from scalper.instruments import Instrument
 from scalper.models import Trade
 
 
@@ -78,15 +80,39 @@ def format_stats(stats: Stats, currency: str = "USD") -> str:
     return "\n".join(f"  {k:<{width}}  {v}" for k, v in rows)
 
 
-def per_symbol_table(trades: list[Trade], initial_capital: float, currency: str = "USD") -> str:
+def avg_stop_pips(trades: list[Trade], profit_multiple: float) -> float | None:
+    """Mean stop distance in pips. TP and SL sit (1 + profit_multiple) stops apart."""
+    if not trades:
+        return None
+    pip = Instrument.from_symbol(trades[0].symbol).pip_size
+    return sum(abs(t.take_profit - t.stop_loss) for t in trades) / (1 + profit_multiple) / pip / len(trades)
+
+
+def per_symbol_table(
+    trades: list[Trade],
+    initial_capital: float,
+    currency: str = "USD",
+    profit_multiple: float = 1.5,
+    spread_pips: Callable[[str], float] | None = None,
+) -> str:
+    """One row per pair. ``Stop`` is the average stop in pips; ``Spread/stop``
+    shows how much of each stop the configured spread uses up."""
     symbols = sorted({t.symbol for t in trades})
     if not symbols:
         return "  (no closed trades)"
-    lines = [f"  {'Symbol':<8} {'Trades':>6} {'Win %':>7} {'PF':>7} {'Net ' + currency:>14}"]
+    header = f"  {'Symbol':<8} {'Trades':>6} {'Win %':>7} {'PF':>7} {'Net ' + currency:>14} {'Stop':>7}"
+    if spread_pips is not None:
+        header += f" {'Spread/stop':>12}"
+    lines = [header]
     for s in symbols:
-        st = compute_stats([t for t in trades if t.symbol == s], initial_capital)
-        lines.append(
+        mine = [t for t in trades if t.symbol == s]
+        st = compute_stats(mine, initial_capital)
+        stop = avg_stop_pips(mine, profit_multiple)
+        row = (
             f"  {s:<8} {st.trades:>6} {_fmt(st.win_rate, '.1f'):>7} "
-            f"{_fmt(st.profit_factor, '.2f'):>7} {st.net_profit:>14,.2f}"
+            f"{_fmt(st.profit_factor, '.2f'):>7} {st.net_profit:>14,.2f} {_fmt(stop, '.1f', 'p'):>7}"
         )
+        if spread_pips is not None and stop:
+            row += f" {spread_pips(s) / stop * 100:>11.0f}%"
+        lines.append(row)
     return "\n".join(lines)
