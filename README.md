@@ -96,7 +96,9 @@ Every single backtest also splits the results by direction and by signal time (3
 python -m scalper backtest --days 360 --min-stop-spread 0 3 4 5 6 --no-entry 1645-1730
 ```
 
-To use it in paper trading, set `min_stop_spread_ratio` under `risk:` in `config/paper.yaml`. `no_entry_windows` there works the same way as `--no-entry`. A `--no-costs` backtest still applies the filter with the configured spreads, so it takes the same trades as the run with costs.
+The shipped `config/paper.yaml` turns both on (`min_stop_spread_ratio: 4`, `no_entry_windows: ["1630-1800"]`), based on a year of Dukascopy data: with them the backtest made PF 1.5 over 158 trades instead of an inflated PF 1.9 that got half its profit from the rollover. The last six months were much weaker than the six before, so treat the paper results as the real test. Set them to `null` and `[]` to trade exactly like the Pine script.
+
+The `--min-stop-spread` and `--no-entry` flags override them for a single backtest (`--min-stop-spread 0` and `--no-entry none` switch them off). A `--no-costs` backtest still applies the filter with the configured spreads, so it takes the same trades as the run with costs.
 
 #### Using data exported from TradingView
 

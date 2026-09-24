@@ -143,7 +143,8 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     if len(ratios) == 1:
         cfg.risk.min_stop_spread_ratio = ratios[0]
     if args.no_entry:
-        cfg.risk.no_entry_windows = list(args.no_entry)
+        none = [w.lower() for w in args.no_entry] == ["none"]
+        cfg.risk.no_entry_windows = [] if none else list(args.no_entry)
     cfg.validate()
     if len(ratios) > 1 and args.trades_out:
         raise ConfigError("--trades-out needs a single --min-stop-spread value")
@@ -407,7 +408,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-entry",
         nargs="+",
         metavar="HHMM-HHMM",
-        help="no new trades on bars opening in these windows (session timezone), e.g. 1645-1730",
+        help="no new trades on bars opening in these windows (session timezone), e.g. 1630-1800; "
+        "'none' turns off the windows set in the config",
     )
     b.add_argument("--trades-out", help="write the trade list to this CSV")
     b.add_argument("--log-level", help="e.g. INFO to see every signal and fill")

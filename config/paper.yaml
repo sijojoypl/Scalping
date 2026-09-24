@@ -44,8 +44,13 @@ costs:
 risk:                         # optional guard rails, not part of the Pine script
   max_open_positions: 4
   max_daily_loss_pct: null    # e.g. 3.0 blocks new entries after a 3% losing day
-  min_stop_spread_ratio: null # e.g. 5.0 skips signals whose stop is under 5 spreads
-  no_entry_windows: []        # e.g. ["1645-1730"] skips the 17:00 New York rollover
+  # The two settings below come from a year of Dukascopy M5 data (Sep 2025 -
+  # Sep 2026). Set them to null and [] to trade exactly like the Pine script.
+  # Stops under 4 spreads lost to costs; 3x-5x all helped, 4x was best.
+  min_stop_spread_ratio: 4
+  # Around the 17:00 New York rollover spreads blow out; in bid-only data that
+  # shows up as fake dips that produced half the backtest profit.
+  no_entry_windows: ["1630-1800"]
 
 feed:
   provider: yahoo             # yahoo (free, no key) | oanda (needs token) | csv | synthetic

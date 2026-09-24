@@ -153,3 +153,6 @@ def test_cli_stop_filter_sweep_and_until(tmp_path, capsys):
     assert main(args + ["--no-entry", "1645-1730"]) == 0
     out = capsys.readouterr().out
     assert "No entry: 1645-1730 (America/New_York)" in out and "Signal time (New York):" in out
+
+    assert main(args + ["--no-entry", "none"]) == 0
+    assert "No entry:" not in capsys.readouterr().out
