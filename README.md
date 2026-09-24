@@ -60,7 +60,7 @@ python -m scalper backtest --days 30    # trade the last 30 days; the 15 days be
 | command                                  | source                                                     |
 |------------------------------------------|------------------------------------------------------------|
 | `python -m scalper fetch`                | Yahoo (default). Free, but Yahoo sometimes refuses with HTTP 429, especially from servers and VPSs. |
-| `python -m scalper fetch --provider dukascopy` | Dukascopy's free historical data, no key. One file per pair per day, so it takes a minute or two. Prices are bid, not mid. |
+| `python -m scalper fetch --provider dukascopy` | Dukascopy's free historical data, no key. One file per pair per day, downloaded 6 at a time: about 1-2 minutes per pair for a year. Prices are bid, not mid. |
 | `python -m scalper fetch --provider oanda`     | OANDA, needs `OANDA_API_TOKEN` (free practice account). |
 
 Useful variations:
@@ -72,6 +72,25 @@ python -m scalper backtest --days 30 --log-level INFO   # print every signal, fi
 ```
 
 Without `--days` the backtest uses every bar in `data/`. Yahoo keeps about 59 days of 5-minute history, so `fetch --days 59` is the most it can give; Dukascopy and OANDA go back further.
+
+#### Stop-size filter
+
+On real data the costs decide the result: stops in the quiet Sydney hours are only a few pips, so a 1.5-3 pip spread eats a big share of each one. The per-pair table shows this in its `Stop` and `Spread/stop` columns.
+
+`risk.min_stop_spread_ratio` skips any signal whose stop is smaller than that many spreads. It is off by default, which keeps the bot identical to the Pine script. Compare settings in one run:
+
+```bash
+python -m scalper backtest --days 360 --min-stop-spread 0 3 4 5 6 8
+```
+
+Pick a value from a range of settings that all do well, not the single best row. Then check it on data it was not chosen on: choose on the older half with `--until`, and confirm on the recent half.
+
+```bash
+python -m scalper backtest --until 2026-03-24 --days 180 --min-stop-spread 0 3 4 5 6 8   # choose here
+python -m scalper backtest --days 180 --min-stop-spread 5                                 # then confirm here
+```
+
+To use it in paper trading, set `min_stop_spread_ratio` under `risk:` in `config/paper.yaml`. A `--no-costs` backtest still applies the filter with the configured spreads, so it takes the same trades as the run with costs.
 
 #### Using data exported from TradingView
 

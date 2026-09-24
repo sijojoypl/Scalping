@@ -118,17 +118,28 @@ def _print_summary(cfg: Config, state_dir: Path) -> int:
     return 0
 
 
+def _skip_summary(stats) -> str:
+    skipped = sorted(((k[len("skipped: "):], v) for k, v in stats.items() if k.startswith("skipped: ")),
+                     key=lambda kv: -kv[1])
+    if not skipped:
+        return ""
+    return "  Skipped signals: " + ", ".join(f"{n} {reason}" for reason, n in skipped)
+
+
 def cmd_backtest(args: argparse.Namespace) -> int:
+    import copy
+
     from scalper.backtest import run_backtest
 
     cfg = _config(args)
     if args.symbols:
         cfg.symbols = args.symbols
-    if args.no_costs:
-        cfg.costs.spread_pips = {"default": 0.0}
-        cfg.costs.slippage_pips = 0.0
-        cfg.costs.commission_per_100k = 0.0
+    ratios = args.min_stop_spread or []
+    if len(ratios) == 1:
+        cfg.risk.min_stop_spread_ratio = ratios[0]
     cfg.validate()
+    if len(ratios) > 1 and args.trades_out:
+        raise ConfigError("--trades-out needs a single --min-stop-spread value")
     setup_logging(args.log_level or "WARNING")
 
     if args.synthetic:
@@ -144,6 +155,15 @@ def cmd_backtest(args: argparse.Namespace) -> int:
             )
         source = f"CSV files in {data_dir}"
 
+    if args.until:
+        try:
+            until = datetime.strptime(args.until, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError as exc:
+            raise ConfigError("--until takes a date like 2026-06-30") from exc
+        data = {s: [b for b in bars if b.time < until] for s, bars in data.items()}
+        if not any(data.get(s) for s in cfg.symbols):
+            raise ConfigError(f"no data before {args.until}")
+
     traded = [b for s, b in data.items() if s in cfg.symbols and b]
     first = min(b[0].time for b in traded)
     last = max(b[-1].time for b in traded)
@@ -157,14 +177,22 @@ def cmd_backtest(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             start = None
-    result = run_backtest(cfg, data, start)
     window_start = start or first
-    print(f"Backtest: {', '.join(cfg.symbols)} M{cfg.timeframe_minutes} on {source}")
+    costs_note = " (no costs)" if args.no_costs else ""
+    print(f"Backtest: {', '.join(cfg.symbols)} M{cfg.timeframe_minutes} on {source}{costs_note}")
+    print(f"Period  : {window_start:%Y-%m-%d %H:%M} -> {last:%Y-%m-%d %H:%M} UTC")
+
+    if len(ratios) > 1:
+        return _sweep(cfg, data, start, not args.no_costs, ratios, run_backtest, copy)
+
+    result = run_backtest(cfg, data, start, charge_costs=not args.no_costs)
     print(
-        f"Period  : {window_start:%Y-%m-%d %H:%M} -> {last:%Y-%m-%d %H:%M} UTC, "
-        f"{result.bars_processed:,} bars"
+        f"Bars    : {result.bars_processed:,}"
         + (f" (+{result.warmup_bars:,} warm-up bars before)" if result.warmup_bars else "")
     )
+    ratio = cfg.risk.min_stop_spread_ratio
+    if ratio:
+        print(f"Filter  : skip signals whose stop is under {ratio:g}x the spread")
     print(format_stats(result.stats, cfg.account.currency))
     print(
         per_symbol_table(
@@ -175,6 +203,9 @@ def cmd_backtest(args: argparse.Namespace) -> int:
             cfg.costs.spread_for,
         )
     )
+    summary = _skip_summary(result.engine.stats)
+    if summary:
+        print(summary)
     open_pos = result.engine.broker.positions
     if open_pos:
         print(f"  Still open at the end: {', '.join(open_pos)}")
@@ -183,6 +214,28 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     if args.trades_out:
         write_trades(args.trades_out, result.trades)
         print(f"Trades written to {args.trades_out}")
+    return 0
+
+
+def _sweep(cfg, data, start, charge_costs, ratios, run_backtest, copy) -> int:
+    """One backtest per --min-stop-spread value, summarised in one table."""
+    cur = cfg.account.currency
+    print("\nStop filter sweep (0 = off). Look for a range of values that all do well,")
+    print("not the single best row: one lucky setting is usually noise.\n")
+    print(f"  {'Min stop':>9} {'Trades':>7} {'Win %':>7} {'PF':>7} {'Net ' + cur:>13} {'Net %':>7} {'Max DD %':>9}")
+    for ratio in ratios:
+        run_cfg = copy.deepcopy(cfg)
+        run_cfg.risk.min_stop_spread_ratio = ratio
+        run_cfg.validate()
+        st = run_backtest(run_cfg, data, start, charge_costs=charge_costs).stats
+        label = "off" if not ratio else f"{ratio:g}x spr"
+        pf = "n/a" if st.profit_factor is None else f"{st.profit_factor:.2f}"
+        win = "n/a" if st.win_rate is None else f"{st.win_rate:.1f}"
+        print(
+            f"  {label:>9} {st.trades:>7} {win:>7} {pf:>7} {st.net_profit:>13,.2f} "
+            f"{st.net_profit_pct:>6.2f}% {st.max_drawdown_pct:>8.2f}%",
+            flush=True,
+        )
     return 0
 
 
@@ -230,10 +283,10 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def _fetch_feed(cfg: Config, provider: str):
     if provider == "dukascopy":
-        log.info("downloading one Dukascopy file per pair per day; this takes a minute or two")
+        log.info("Dukascopy keeps one file per pair per day; about 1-2 minutes per pair for a year")
         return DukascopyFeed(
             cfg.timeframe_minutes,
-            progress=lambda sym, n: log.info("%s: %s one-minute candles downloaded", sym, f"{n:,}"),
+            progress=lambda sym, done, total: log.info("%s: %d/%d days downloaded", sym, done, total),
         )
     return _live_feed(cfg)
 
@@ -319,6 +372,14 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--days", type=int, help="test only the last N days; earlier bars warm up the indicators")
     b.add_argument("--seed", type=int, default=7, help="synthetic seed (default 7)")
     b.add_argument("--no-costs", action="store_true", help="zero spread/slippage/commission, like TradingView defaults")
+    b.add_argument(
+        "--min-stop-spread",
+        type=float,
+        nargs="+",
+        metavar="X",
+        help="skip signals whose stop is under X spreads; give several values to compare them (0 = off)",
+    )
+    b.add_argument("--until", metavar="YYYY-MM-DD", help="ignore data from this date on (to test on older data)")
     b.add_argument("--trades-out", help="write the trade list to this CSV")
     b.add_argument("--log-level", help="e.g. INFO to see every signal and fill")
     b.set_defaults(func=cmd_backtest)

@@ -306,19 +306,15 @@ def test_dukascopy_rejects_garbled_files():
 
 
 def test_dukascopy_fetch_walks_days_with_zero_based_months():
-    now = datetime(2026, 2, 2, 12, 0, tzinfo=UTC)
-    files = {}
-    for d in (31, 1, 2):  # 31 Jan, 1 Feb (Sunday, no file), 2 Feb
-        month = 0 if d == 31 else 1
-        if d == 1:
-            continue
-        files[f"2026/{month:02d}/{d:02d}"] = bi5(
-            [(60 * i, 170000 + i, 170000 + i, 169990 + i, 170010 + i, 2.0) for i in range(0, 600)]
-        )
+    now = datetime(2026, 2, 2, 12, 0, tzinfo=UTC)  # Monday
+    candles = [(60 * i, 170000 + i, 170000 + i, 169990 + i, 170010 + i, 2.0) for i in range(600)]
+    files = {"2026/00/30": bi5(candles), "2026/01/02": bi5(candles)}  # Friday 30 Jan, Monday 2 Feb
 
     class DaySession:
         headers = {}
-        urls = []
+
+        def __init__(self):
+            self.urls = []
 
         def get(self, url, params=None, timeout=None):
             self.urls.append(url)
@@ -326,13 +322,28 @@ def test_dukascopy_fetch_walks_days_with_zero_based_months():
             return FakeResponse({}, 200, files[key]) if key in files else FakeResponse({}, 404)
 
     session = DaySession()
-    feed = DukascopyFeed(5, session=session, sleep=lambda s: None)
+    progress = []
+    feed = DukascopyFeed(5, session=session, sleep=lambda s: None, progress=lambda *a: progress.append(a))
     bars = feed.fetch_closed("CHFJPY", 5000, now)
-    assert any("/CHFJPY/2026/00/31/BID_candles_min_1.bi5" in u for u in session.urls)
-    assert bars[0].time == datetime(2026, 1, 31, tzinfo=UTC)
+    assert any("/CHFJPY/2026/00/30/BID_candles_min_1.bi5" in u for u in session.urls)
+    assert not any("/2026/00/31/" in u for u in session.urls)  # Saturday skipped
+    assert bars[0].time == datetime(2026, 1, 30, tzinfo=UTC)
     assert bars[0].open == pytest.approx(170.0)  # JPY pairs use 0.001 points
     assert bars[-1].time == datetime(2026, 2, 2, 9, 55, tzinfo=UTC)
     assert len(bars) == 240
+    assert progress[-1] == ("CHFJPY", len(session.urls), len(session.urls))
+
+
+def test_dukascopy_gives_up_on_a_dead_connection():
+    class Dead:
+        headers = {}
+
+        def get(self, url, params=None, timeout=None):
+            raise ConnectionError("refused")
+
+    feed = DukascopyFeed(5, session=Dead(), sleep=lambda s: None, workers=2)
+    with pytest.raises(FeedError, match="after 4 tries: refused"):
+        feed.fetch_closed("USDCHF", 300, datetime(2026, 2, 4, tzinfo=UTC))
 
 
 def test_find_csv_accepts_tradingview_export_names(tmp_path):

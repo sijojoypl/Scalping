@@ -68,6 +68,9 @@ class CostConfig:
 class RiskConfig:
     max_open_positions: int | None = None
     max_daily_loss_pct: float | None = None  # e.g. 3.0 stops new entries for the UTC day
+    # Skip a signal when its stop is smaller than this many spreads (e.g. 5.0
+    # needs a 7.5 pip stop at a 1.5 pip spread). Costs eat tight stops alive.
+    min_stop_spread_ratio: float | None = None
 
 
 @dataclass
@@ -145,6 +148,11 @@ class Config:
             raise ConfigError(f"feed.provider must be one of {FEED_PROVIDERS}")
         if self.feed.history_bars < 100:
             raise ConfigError("feed.history_bars must be >= 100 so indicators can warm up")
+        ratio = self.risk.min_stop_spread_ratio
+        if ratio is not None and ratio < 0:
+            raise ConfigError("risk.min_stop_spread_ratio must be positive (or null to turn it off)")
+        if ratio == 0:
+            self.risk.min_stop_spread_ratio = None
         if self.feed.oanda.environment not in ("practice", "live"):
             raise ConfigError("feed.oanda.environment must be 'practice' or 'live'")
         self.fx_fallback_rates = {k.upper(): float(v) for k, v in self.fx_fallback_rates.items()}

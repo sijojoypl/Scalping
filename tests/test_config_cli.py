@@ -123,3 +123,28 @@ def test_cli_fetch_points_to_other_sources_when_yahoo_refuses(tmp_path, capsys, 
     monkeypatch.setattr(cli, "_live_feed", lambda cfg: Refusing())
     assert main(["fetch", "--out", str(tmp_path)]) == 1
     assert "--provider dukascopy" in capsys.readouterr().err
+
+
+def test_cli_stop_filter_sweep_and_until(tmp_path, capsys):
+    from scalper.feeds import generate_synthetic, save_csv
+
+    symbols = ["USDCHF", "CHFJPY", "AUDCAD", "GBPAUD", "USDJPY", "USDCAD", "AUDUSD"]
+    for s, bars in generate_synthetic(symbols, days=40, seed=3).items():
+        save_csv(tmp_path / f"{s}_M5.csv", bars)
+
+    args = ["backtest", "--data-dir", str(tmp_path), "--days", "20"]
+    assert main(args + ["--min-stop-spread", "0", "4", "8"]) == 0
+    out = capsys.readouterr().out
+    rows = [line for line in out.splitlines() if line.strip().startswith(("off", "4x", "8x"))]
+    assert len(rows) == 3
+    trades = [int(r.split()[1] if r.split()[0] == "off" else r.split()[2]) for r in rows]
+    assert trades[0] >= trades[1] >= trades[2]
+
+    assert main(args + ["--min-stop-spread", "5"]) == 0
+    assert "under 5x the spread" in capsys.readouterr().out
+
+    assert main(args + ["--until", "2026-01-30"]) == 0
+    period = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("Period"))
+    assert "-> 2026-01-29" in period
+
+    assert main(args + ["--until", "30-01-2026"]) == 2

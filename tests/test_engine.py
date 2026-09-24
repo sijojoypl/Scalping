@@ -165,3 +165,33 @@ def test_report_shows_average_stop_and_spread_share():
     row = table.splitlines()[1]
     stop = avg_stop_pips(trades, 1.5)
     assert f"{stop:.1f}p" in row and f"{1.5 / stop * 100:.0f}%" in row
+
+
+def test_stop_filter_skips_small_stops_and_counts_them():
+    cfg = no_cost_config(symbols=["USDCHF"])
+    cfg.costs.spread_pips = {"default": 1.5}
+    data = generate_synthetic(["USDCHF"], days=40, seed=7)
+    base = run_backtest(cfg, data)
+    stops = sorted(abs(t.take_profit - t.stop_loss) / 2.5 / 0.0001 for t in base.trades)
+    ratio = stops[len(stops) // 2] / 1.5  # a threshold between the smallest and largest stops
+
+    cfg.risk.min_stop_spread_ratio = ratio
+    filtered = run_backtest(cfg, data)
+    assert filtered.engine.stats["skipped: stop too small for the spread"] > 0
+    assert 0 < len(filtered.trades) < len(base.trades)
+    for t in filtered.trades:
+        assert abs(t.take_profit - t.stop_loss) / 2.5 / 0.0001 >= ratio * 1.5 - 1e-9
+
+
+def test_no_cost_run_takes_the_same_filtered_trades():
+    cfg = no_cost_config(symbols=["USDCHF"])
+    cfg.costs.spread_pips = {"default": 1.5}
+    cfg.risk.min_stop_spread_ratio = 7  # 10.5 pips; synthetic USDCHF stops sit around 10
+    data = generate_synthetic(["USDCHF"], days=40, seed=7)
+    charged = run_backtest(cfg, data)
+    assert charged.engine.stats["skipped: stop too small for the spread"] > 0
+    free = run_backtest(cfg, data, charge_costs=False)
+    key = lambda t: (t.entry_time, t.side)  # noqa: E731
+    assert [key(t) for t in free.trades][:5] == [key(t) for t in charged.trades][:5]
+    assert free.engine.stats["skipped: stop too small for the spread"] > 0
+    assert free.stats.net_profit > charged.stats.net_profit

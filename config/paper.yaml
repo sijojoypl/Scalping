@@ -44,6 +44,7 @@ costs:
 risk:                         # optional guard rails, not part of the Pine script
   max_open_positions: 4
   max_daily_loss_pct: null    # e.g. 3.0 blocks new entries after a 3% losing day
+  min_stop_spread_ratio: null # e.g. 5.0 skips signals whose stop is under 5 spreads
 
 feed:
   provider: yahoo             # yahoo (free, no key) | oanda (needs token) | csv | synthetic

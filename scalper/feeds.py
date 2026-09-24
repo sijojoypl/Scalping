@@ -16,14 +16,17 @@ from __future__ import annotations
 
 import bisect
 import csv
+import logging
 import lzma
 import math
 import os
 import random
 import re
 import struct
+import threading
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
@@ -33,6 +36,8 @@ import requests
 
 from scalper.instruments import Instrument, normalize_symbol
 from scalper.models import Bar
+
+log = logging.getLogger(__name__)
 
 
 class FeedError(RuntimeError):
@@ -285,56 +290,75 @@ class DukascopyFeed:
     def __init__(
         self,
         timeframe_minutes: int,
-        timeout: float = 30.0,
+        timeout: float = 20.0,
         session=None,
         retries: int = 3,
         backoff_seconds: float = 3.0,
-        pause_seconds: float = 0.3,
+        workers: int = 6,
         sleep=time.sleep,
         progress=None,
     ):
         self.tf_minutes = timeframe_minutes
         self.tf = timedelta(minutes=timeframe_minutes)
         self.timeout = timeout
-        self.session = session if session is not None else browser_session()
+        # One HTTP session per download thread; an injected session is shared.
+        self._new_session = (lambda: session) if session is not None else browser_session
+        self._local = threading.local()
         self.retries = retries
         self.backoff = backoff_seconds
-        self.pause = pause_seconds
+        self.workers = workers
         self._sleep = sleep
         self._progress = progress
 
     def fetch_closed(self, symbol: str, count: int, now: datetime) -> list[Bar]:
         symbol = normalize_symbol(symbol)
         scale = 1_000 if symbol.endswith("JPY") else 100_000  # prices are stored as integer points
-        days = math.ceil(count * self.tf_minutes / 1440) + 1
-        first_day = (now - timedelta(days=days)).date()
-        minutes: list[Bar] = []
+        first_day = (now - timedelta(days=math.ceil(count * self.tf_minutes / 1440) + 1)).date()
+        days = []
         day = first_day
         while day <= now.date():
-            raw = self._download(symbol, day)
-            if raw:
-                start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-                minutes.extend(self.decode(raw, start, scale, symbol))
+            if day.weekday() != 5:  # nothing trades on Saturday
+                days.append(day)
             day += timedelta(days=1)
-            self._sleep(self.pause)
-        if self._progress:
-            self._progress(symbol, len(minutes))
+
+        files: dict = {}
+        pool = ThreadPoolExecutor(max_workers=self.workers)
+        try:
+            futures = {pool.submit(self._download, symbol, d): d for d in days}
+            for n, fut in enumerate(as_completed(futures), 1):
+                files[futures[fut]] = fut.result()
+                if self._progress and (n % 25 == 0 or n == len(days)):
+                    self._progress(symbol, n, len(days))
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+        minutes: list[Bar] = []
+        for d in days:
+            if files.get(d):
+                start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+                minutes.extend(self.decode(files[d], start, scale, symbol))
         bars = aggregate(minutes, self.tf_minutes)
         return [b for b in bars if is_closed(b.time, self.tf, now)][-count:]
+
+    def _session(self):
+        if not hasattr(self._local, "session"):
+            self._local.session = self._new_session()
+        return self._local.session
 
     def _download(self, symbol: str, day) -> bytes:
         url = self.URL.format(symbol=symbol, y=day.year, m=day.month - 1, d=day.day)  # months are 0-based
         problem = ""
         for attempt in range(self.retries + 1):
             if attempt:
+                log.warning("Dukascopy %s %s: %s, retrying", symbol, day, problem)
                 self._sleep(self.backoff * 2 ** (attempt - 1))
             try:
-                resp = self.session.get(url, timeout=self.timeout)
+                resp = self._session().get(url, timeout=self.timeout)
             except OSError as exc:
-                problem = str(exc)
+                problem = str(exc) or type(exc).__name__
                 continue
             if resp.status_code == 404:
-                return b""  # no file for this day (weekend, holiday or today)
+                return b""  # no file for this day (holiday, or today)
             if resp.status_code == 429 or resp.status_code >= 500:
                 problem = f"HTTP {resp.status_code}"
                 continue

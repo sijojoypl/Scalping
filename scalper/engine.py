@@ -13,7 +13,7 @@ from collections.abc import Callable
 from datetime import datetime
 
 from scalper.broker import PaperBroker
-from scalper.config import Config
+from scalper.config import Config, CostConfig
 from scalper.instruments import Instrument
 from scalper.models import Bar, EntryOrder, FillEvent, Trade
 from scalper.rates import RateBook
@@ -105,7 +105,7 @@ class Engine:
             f"(rsi_ma {snap.rsi_ma:.2f}, atr {inst.fmt(snap.atr or 0)})"
         )
 
-        skip = self._entry_block_reason(symbol, bar, allow_entries)
+        skip = self._entry_block_reason(symbol, bar, allow_entries, snap.risk_distance)
         if skip:
             self.stats[f"skipped: {skip}"] += 1
             log.info("%s skipped: %s", desc, skip)
@@ -149,12 +149,21 @@ class Engine:
             desc, f"{qty:,}", inst.fmt(snap.stop_loss), inst.fmt(snap.take_profit),
         )
 
-    def _entry_block_reason(self, symbol: str, bar: Bar, allow_entries: bool) -> str | None:
+    def _entry_block_reason(
+        self, symbol: str, bar: Bar, allow_entries: bool, risk_distance: float
+    ) -> str | None:
         if not self.broker.is_flat(symbol):
             return "position already open"
         if not allow_entries:
             return "stale bar (catch-up after downtime)"
         risk = self.config.risk
+        if risk.min_stop_spread_ratio is not None:
+            # Uses the configured spread even in a --no-costs backtest, so both
+            # runs take the same trades and only the charges differ.
+            spread = self.config.costs.spread_for(symbol)
+            stop_pips = risk_distance / self.instruments[symbol].pip_size
+            if spread > 0 and stop_pips < risk.min_stop_spread_ratio * spread:
+                return "stop too small for the spread"
         if risk.max_open_positions is not None and self.broker.exposure_count() >= risk.max_open_positions:
             return "max open positions reached"
         if risk.max_daily_loss_pct is not None:
@@ -186,8 +195,13 @@ class Engine:
         return {s: p for s, p in self.last_close.items() if s in self.strategies}
 
 
-def build_engine(config: Config, on_trade: Callable[[Trade], None] | None = None) -> Engine:
+def build_engine(
+    config: Config, on_trade: Callable[[Trade], None] | None = None, charge_costs: bool = True
+) -> Engine:
+    """``charge_costs=False`` fills without spread, slippage or commission (TradingView's
+    default), while filters that look at the configured spread still see it."""
     rates = RateBook(config.account.currency, config.fx_fallback_rates)
     instruments = {s: Instrument.from_symbol(s) for s in config.symbols}
-    broker = PaperBroker(instruments, rates, config.costs, config.account.initial_capital)
+    costs = config.costs if charge_costs else CostConfig(spread_pips={"default": 0.0})
+    broker = PaperBroker(instruments, rates, costs, config.account.initial_capital)
     return Engine(config, broker, rates, on_trade=on_trade)

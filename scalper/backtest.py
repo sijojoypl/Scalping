@@ -41,10 +41,13 @@ def merged_stream(bars_by_symbol: dict[str, list[Bar]], first: set[str]):
 
 
 def run_backtest(
-    config: Config, bars_by_symbol: dict[str, list[Bar]], start: datetime | None = None
+    config: Config,
+    bars_by_symbol: dict[str, list[Bar]],
+    start: datetime | None = None,
+    charge_costs: bool = True,
 ) -> BacktestResult:
     """Run the engine over the bars. With ``start``, earlier bars only warm up the indicators."""
-    engine = build_engine(config)
+    engine = build_engine(config, charge_costs=charge_costs)
     missing = [s for s in config.symbols if not bars_by_symbol.get(s)]
     if missing:
         raise ValueError(f"no bars for traded symbol(s): {', '.join(missing)}")
