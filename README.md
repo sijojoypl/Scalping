@@ -90,7 +90,13 @@ python -m scalper backtest --until 2026-03-24 --days 180 --min-stop-spread 0 3 4
 python -m scalper backtest --days 180 --min-stop-spread 5                                 # then confirm here
 ```
 
-To use it in paper trading, set `min_stop_spread_ratio` under `risk:` in `config/paper.yaml`. A `--no-costs` backtest still applies the filter with the configured spreads, so it takes the same trades as the run with costs.
+Every single backtest also splits the results by direction and by signal time (30-minute slots, New York time). Watch the 17:00 rollover: spreads jump to 10-30 pips for a few minutes, and in bid-only data such as Dukascopy's that looks like a sharp dip the strategy loves to buy. Profits piled up in LONG trades around 17:00 are that artifact, not an edge. To test without it:
+
+```bash
+python -m scalper backtest --days 360 --min-stop-spread 0 3 4 5 6 --no-entry 1645-1730
+```
+
+To use it in paper trading, set `min_stop_spread_ratio` under `risk:` in `config/paper.yaml`. `no_entry_windows` there works the same way as `--no-entry`. A `--no-costs` backtest still applies the filter with the configured spreads, so it takes the same trades as the run with costs.
 
 #### Using data exported from TradingView
 

@@ -17,6 +17,7 @@ from scalper.config import Config, CostConfig
 from scalper.instruments import Instrument
 from scalper.models import Bar, EntryOrder, FillEvent, Trade
 from scalper.rates import RateBook
+from scalper.session import SessionWindow
 from scalper.strategy import ReverseRSIStrategy, Snapshot
 
 log = logging.getLogger(__name__)
@@ -42,6 +43,8 @@ class Engine:
         self.instruments = {s: Instrument.from_symbol(s) for s in config.symbols}
         self.strategies = {s: ReverseRSIStrategy(config.strategy, i) for s, i in self.instruments.items()}
         self.aux_symbols = rates.required_aux(config.symbols)
+        tz = config.strategy.session_timezone
+        self.no_entry = [SessionWindow.parse(f"{w}:1234567", tz) for w in config.risk.no_entry_windows]
         self.last_bar_time: dict[str, datetime] = {}
         self.last_close: dict[str, float] = {}
         self.last_snapshot: dict[str, Snapshot] = {}
@@ -157,6 +160,8 @@ class Engine:
         if not allow_entries:
             return "stale bar (catch-up after downtime)"
         risk = self.config.risk
+        if any(w.contains(bar.time) for w in self.no_entry):
+            return "inside a no-entry window"
         if risk.min_stop_spread_ratio is not None:
             # Uses the configured spread even in a --no-costs backtest, so both
             # runs take the same trades and only the charges differ.

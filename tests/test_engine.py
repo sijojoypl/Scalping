@@ -195,3 +195,39 @@ def test_no_cost_run_takes_the_same_filtered_trades():
     assert [key(t) for t in free.trades][:5] == [key(t) for t in charged.trades][:5]
     assert free.engine.stats["skipped: stop too small for the spread"] > 0
     assert free.stats.net_profit > charged.stats.net_profit
+
+
+def test_no_entry_windows_block_signals_inside_them():
+    from datetime import time as dtime
+    from zoneinfo import ZoneInfo
+
+    cfg = no_cost_config()
+    data = generate_synthetic(cfg.symbols + ["USDJPY", "USDCAD", "AUDUSD"], days=40, seed=7)
+    base = run_backtest(cfg, data)
+
+    cfg.risk.no_entry_windows = ["1645-1730"]
+    cfg.validate()
+    result = run_backtest(cfg, data)
+    ny = ZoneInfo("America/New_York")
+    assert result.engine.stats["skipped: inside a no-entry window"] > 0
+    assert 0 < len(result.trades) < len(base.trades)
+    for t in result.trades:
+        signal = (t.entry_time - timedelta(minutes=5)).astimezone(ny).time()
+        assert not (dtime(16, 45) <= signal < dtime(17, 30)), t
+
+    cfg.risk.no_entry_windows = ["1600-1900"]  # the whole session
+    assert run_backtest(cfg, data).trades == []
+
+
+def test_breakdown_table_splits_by_side_and_signal_time():
+    from scalper.report import breakdown_table
+
+    cfg = no_cost_config()
+    data = generate_synthetic(cfg.symbols + ["USDJPY", "USDCAD", "AUDUSD"], days=40, seed=7)
+    trades = run_backtest(cfg, data).trades
+    table = breakdown_table(trades, 50_000, "America/New_York")
+    rows = {line.split()[0]: int(line.split()[1]) for line in table.splitlines()[1:] if "Signal" not in line}
+    assert rows["LONG"] + rows["SHORT"] == len(trades)
+    buckets = {k: v for k, v in rows.items() if ":" in k}
+    assert sum(buckets.values()) == len(trades)
+    assert set(buckets) <= {"16:00-16:30", "16:30-17:00", "17:00-17:30", "17:30-18:00", "18:00-18:30", "18:30-19:00"}

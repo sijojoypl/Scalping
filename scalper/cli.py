@@ -23,7 +23,12 @@ from scalper.feeds import (
     save_csv,
 )
 from scalper.rates import RateBook
-from scalper.report import compute_stats, format_stats, per_symbol_table
+from scalper.report import (
+    breakdown_table,
+    compute_stats,
+    format_stats,
+    per_symbol_table,
+)
 from scalper.runner import JOURNAL_FILE, STATE_FILE, PaperTrader
 from scalper.storage import read_trades, write_trades
 
@@ -137,6 +142,8 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     ratios = args.min_stop_spread or []
     if len(ratios) == 1:
         cfg.risk.min_stop_spread_ratio = ratios[0]
+    if args.no_entry:
+        cfg.risk.no_entry_windows = list(args.no_entry)
     cfg.validate()
     if len(ratios) > 1 and args.trades_out:
         raise ConfigError("--trades-out needs a single --min-stop-spread value")
@@ -193,6 +200,8 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     ratio = cfg.risk.min_stop_spread_ratio
     if ratio:
         print(f"Filter  : skip signals whose stop is under {ratio:g}x the spread")
+    if cfg.risk.no_entry_windows:
+        print(f"No entry: {', '.join(cfg.risk.no_entry_windows)} ({cfg.strategy.session_timezone})")
     print(format_stats(result.stats, cfg.account.currency))
     print(
         per_symbol_table(
@@ -203,6 +212,15 @@ def cmd_backtest(args: argparse.Namespace) -> int:
             cfg.costs.spread_for,
         )
     )
+    table = breakdown_table(
+        result.trades,
+        cfg.account.initial_capital,
+        cfg.strategy.session_timezone,
+        cfg.timeframe_minutes,
+        currency=cfg.account.currency,
+    )
+    if table:
+        print(table)
     summary = _skip_summary(result.engine.stats)
     if summary:
         print(summary)
@@ -385,6 +403,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip signals whose stop is under X spreads; give several values to compare them (0 = off)",
     )
     b.add_argument("--until", metavar="YYYY-MM-DD", help="ignore data from this date on (to test on older data)")
+    b.add_argument(
+        "--no-entry",
+        nargs="+",
+        metavar="HHMM-HHMM",
+        help="no new trades on bars opening in these windows (session timezone), e.g. 1645-1730",
+    )
     b.add_argument("--trades-out", help="write the trade list to this CSV")
     b.add_argument("--log-level", help="e.g. INFO to see every signal and fill")
     b.set_defaults(func=cmd_backtest)

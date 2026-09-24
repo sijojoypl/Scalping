@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
+from zoneinfo import ZoneInfo
 
 from scalper.instruments import Instrument
 from scalper.models import Trade
@@ -78,6 +80,47 @@ def format_stats(stats: Stats, currency: str = "USD") -> str:
     ]
     width = max(len(k) for k, _ in rows)
     return "\n".join(f"  {k:<{width}}  {v}" for k, v in rows)
+
+
+def breakdown_table(
+    trades: list[Trade],
+    initial_capital: float,
+    tz_name: str,
+    timeframe_minutes: int = 5,
+    bucket_minutes: int = 30,
+    currency: str = "USD",
+) -> str:
+    """Results by direction and by signal time of day (in the session timezone).
+
+    A strategy that only makes money on longs around the 17:00 New York
+    rollover is usually trading spread spikes in bid-only data.
+    """
+    if not trades:
+        return ""
+    tz = ZoneInfo(tz_name)
+    groups: dict[str, list[Trade]] = {}
+    for t in sorted(trades, key=lambda t: t.side.value):
+        groups.setdefault(t.side.value, []).append(t)
+    step = timedelta(minutes=timeframe_minutes)
+    times: dict[str, list[Trade]] = {}
+    for t in trades:
+        local = (t.entry_time - step).astimezone(tz)  # the signal bar opened one bar before the fill
+        minute = local.hour * 60 + local.minute
+        start = minute - minute % bucket_minutes
+        label = f"{start // 60:02d}:{start % 60:02d}-{(start + bucket_minutes) // 60 % 24:02d}:{(start + bucket_minutes) % 60:02d}"
+        times.setdefault(label, []).append(t)
+    zone = tz_name.split("/")[-1].replace("_", " ")
+    lines = [f"  {'':<13} {'Trades':>6} {'Win %':>7} {'PF':>7} {'Net ' + currency:>14}"]
+    for label, rows in [*groups.items(), *(("", None),), *sorted(times.items())]:
+        if rows is None:
+            lines.append(f"  Signal time ({zone}):")
+            continue
+        st = compute_stats(rows, initial_capital)
+        lines.append(
+            f"  {label:<13} {st.trades:>6} {_fmt(st.win_rate, '.1f'):>7} "
+            f"{_fmt(st.profit_factor, '.2f'):>7} {st.net_profit:>14,.2f}"
+        )
+    return "\n".join(lines)
 
 
 def avg_stop_pips(trades: list[Trade], profit_multiple: float) -> float | None:

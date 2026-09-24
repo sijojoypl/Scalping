@@ -29,6 +29,7 @@ def test_shipped_config_is_paper_with_pine_defaults():
         ("symbols: [EURUSDX]\n", "six-letter"),
         ("feed:\n  provider: ftx\n", "feed.provider"),
         ("account:\n  currency: EUR\n", "USD"),
+        ("risk:\n  no_entry_windows: ['16:45-17:30']\n", "no_entry_windows"),
     ],
 )
 def test_bad_configs_rejected(tmp_path, yaml_text, message):
@@ -148,3 +149,7 @@ def test_cli_stop_filter_sweep_and_until(tmp_path, capsys):
     assert "-> 2026-01-29" in period
 
     assert main(args + ["--until", "30-01-2026"]) == 2
+
+    assert main(args + ["--no-entry", "1645-1730"]) == 0
+    out = capsys.readouterr().out
+    assert "No entry: 1645-1730 (America/New_York)" in out and "Signal time (New York):" in out

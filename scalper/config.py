@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 from scalper.instruments import normalize_symbol
+from scalper.session import SessionWindow
 
 SUPPORTED_MODES = ("PAPER",)
 SUPPORTED_TIMEFRAMES = (1, 5, 15, 30, 60)
@@ -71,6 +72,9 @@ class RiskConfig:
     # Skip a signal when its stop is smaller than this many spreads (e.g. 5.0
     # needs a 7.5 pip stop at a 1.5 pip spread). Costs eat tight stops alive.
     min_stop_spread_ratio: float | None = None
+    # No new entries on bars opening inside these windows (strategy session
+    # timezone), e.g. ["1645-1730"] to stay out of the 17:00 New York rollover.
+    no_entry_windows: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -153,6 +157,11 @@ class Config:
             raise ConfigError("risk.min_stop_spread_ratio must be positive (or null to turn it off)")
         if ratio == 0:
             self.risk.min_stop_spread_ratio = None
+        for window in self.risk.no_entry_windows:
+            try:
+                SessionWindow.parse(f"{window}:1234567", self.strategy.session_timezone)
+            except ValueError as exc:
+                raise ConfigError(f"risk.no_entry_windows: {exc}") from exc
         if self.feed.oanda.environment not in ("practice", "live"):
             raise ConfigError("feed.oanda.environment must be 'practice' or 'live'")
         self.fx_fallback_rates = {k.upper(): float(v) for k, v in self.fx_fallback_rates.items()}
