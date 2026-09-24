@@ -49,6 +49,7 @@ class Engine:
         self.last_close: dict[str, float] = {}
         self.last_snapshot: dict[str, Snapshot] = {}
         self.stats: Counter[str] = Counter()
+        self._missing_rates: set[str] = set()
 
     @property
     def all_symbols(self) -> list[str]:
@@ -117,7 +118,12 @@ class Engine:
         quote_rate = self.rates.value(inst.quote)
         if quote_rate is None:
             self.stats["skipped: no conversion rate"] += 1
-            log.warning("%s skipped: no %s conversion rate (add fx_fallback_rates)", desc, inst.quote)
+            if inst.quote not in self._missing_rates:  # once per currency, not per signal
+                self._missing_rates.add(inst.quote)
+                log.warning(
+                    "%s signals are skipped: no %s/USD price and no fx_fallback_rates[%s]",
+                    symbol, inst.quote, inst.quote,
+                )
             return
 
         capital = (

@@ -231,3 +231,14 @@ def test_breakdown_table_splits_by_side_and_signal_time():
     buckets = {k: v for k, v in rows.items() if ":" in k}
     assert sum(buckets.values()) == len(trades)
     assert set(buckets) <= {"16:00-16:30", "16:30-17:00", "17:00-17:30", "17:30-18:00", "18:00-18:30", "18:30-19:00"}
+
+
+def test_missing_conversion_rate_warns_once_per_currency(caplog):
+    cfg = no_cost_config(symbols=["EURGBP"])
+    cfg.fx_fallback_rates = {}
+    data = generate_synthetic(["EURGBP"], days=40, seed=7)
+    with caplog.at_level("WARNING"):
+        result = run_backtest(cfg, data)
+    assert result.trades == []
+    assert result.engine.stats["skipped: no conversion rate"] > 1
+    assert caplog.text.count("signals are skipped: no GBP/USD price") == 1
