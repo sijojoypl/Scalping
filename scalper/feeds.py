@@ -290,12 +290,14 @@ class DukascopyFeed:
     def __init__(
         self,
         timeframe_minutes: int,
-        timeout: float = 20.0,
+        timeout: float = 30.0,
         session=None,
-        retries: int = 3,
-        backoff_seconds: float = 3.0,
-        workers: int = 6,
+        retries: int = 6,
+        backoff_seconds: float = 5.0,
+        workers: int = 2,
+        cache_dir: str | Path | None = None,
         sleep=time.sleep,
+        clock=time.monotonic,
         progress=None,
     ):
         self.tf_minutes = timeframe_minutes
@@ -307,8 +309,15 @@ class DukascopyFeed:
         self.retries = retries
         self.backoff = backoff_seconds
         self.workers = workers
+        self.cache_dir = Path(cache_dir) if cache_dir else None
         self._sleep = sleep
+        self._clock = clock
         self._progress = progress
+        # Dukascopy throttles with 503s and stalled connections. When any
+        # download is pushed back, all of them pause until this moment.
+        self._lock = threading.Lock()
+        self._resume_at = -math.inf
+        self.retry_count = 0
 
     def fetch_closed(self, symbol: str, count: int, now: datetime) -> list[Bar]:
         symbol = normalize_symbol(symbol)
@@ -322,15 +331,47 @@ class DukascopyFeed:
             day += timedelta(days=1)
 
         files: dict = {}
+        todo = []
+        for d in days:
+            cached = self._cache_get(symbol, d)
+            if cached is None:
+                todo.append(d)
+            else:
+                files[d] = cached
+        self.retry_count = 0
+        failed: dict = {}
+        done = len(files)
         pool = ThreadPoolExecutor(max_workers=self.workers)
         try:
-            futures = {pool.submit(self._download, symbol, d): d for d in days}
-            for n, fut in enumerate(as_completed(futures), 1):
-                files[futures[fut]] = fut.result()
-                if self._progress and (n % 25 == 0 or n == len(days)):
-                    self._progress(symbol, n, len(days))
+            futures = {pool.submit(self._download, symbol, d): d for d in todo}
+            for fut in as_completed(futures):
+                d = futures[fut]
+                try:
+                    files[d] = fut.result()
+                    self._cache_put(symbol, d, files[d], now)
+                except FeedError as exc:
+                    failed[d] = exc
+                done += 1
+                if self._progress and (done % 25 == 0 or done == len(days)):
+                    self._progress(symbol, done, len(days), self.retry_count)
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
+
+        for d in sorted(failed):  # one more, slower pass for days that kept failing
+            try:
+                files[d] = self._download(symbol, d)
+                self._cache_put(symbol, d, files[d], now)
+                del failed[d]
+            except FeedError as exc:
+                failed[d] = exc
+        if failed and not any(files.values()):
+            raise FeedError(f"Dukascopy sent no data for {symbol}: {next(iter(failed.values()))}")
+        if failed:
+            missing = ", ".join(d.isoformat() for d in sorted(failed))
+            log.warning(
+                "%s: %d day(s) could not be downloaded (%s). Run the same fetch again to fill them in.",
+                symbol, len(failed), missing,
+            )
 
         minutes: list[Bar] = []
         for d in days:
@@ -340,32 +381,69 @@ class DukascopyFeed:
         bars = aggregate(minutes, self.tf_minutes)
         return [b for b in bars if is_closed(b.time, self.tf, now)][-count:]
 
+    # ------------------------------------------------------------ download
     def _session(self):
         if not hasattr(self._local, "session"):
             self._local.session = self._new_session()
         return self._local.session
+
+    def _wait_turn(self) -> None:
+        while True:
+            with self._lock:
+                wait = self._resume_at - self._clock()
+            if wait <= 0:
+                return
+            self._sleep(wait)
+
+    def _push_back(self, attempt: int) -> None:
+        with self._lock:
+            self.retry_count += 1
+            pause = self.backoff * 2 ** min(attempt, 4)
+            self._resume_at = max(self._resume_at, self._clock() + pause)
 
     def _download(self, symbol: str, day) -> bytes:
         url = self.URL.format(symbol=symbol, y=day.year, m=day.month - 1, d=day.day)  # months are 0-based
         problem = ""
         for attempt in range(self.retries + 1):
             if attempt:
-                log.warning("Dukascopy %s %s: %s, retrying", symbol, day, problem)
-                self._sleep(self.backoff * 2 ** (attempt - 1))
+                log.debug("Dukascopy %s %s: %s, retrying", symbol, day, problem)
+            self._wait_turn()
             try:
                 resp = self._session().get(url, timeout=self.timeout)
             except OSError as exc:
-                problem = str(exc) or type(exc).__name__
+                problem = "timed out" if "timed out" in str(exc).lower() else (str(exc) or type(exc).__name__)
+                self._push_back(attempt)
                 continue
             if resp.status_code == 404:
-                return b""  # no file for this day (holiday, or today)
+                return b""  # no file for this day (holiday, or not published yet)
             if resp.status_code == 429 or resp.status_code >= 500:
                 problem = f"HTTP {resp.status_code}"
+                self._push_back(attempt)
                 continue
             if resp.status_code >= 400:
                 raise FeedError(f"Dukascopy request for {symbol} {day} failed: HTTP {resp.status_code}")
             return resp.content
         raise FeedError(f"Dukascopy request for {symbol} {day} failed after {self.retries + 1} tries: {problem}")
+
+    # --------------------------------------------------------------- cache
+    def _cache_path(self, symbol: str, day) -> Path | None:
+        return self.cache_dir / symbol / f"{day.isoformat()}.bi5" if self.cache_dir else None
+
+    def _cache_get(self, symbol: str, day) -> bytes | None:
+        path = self._cache_path(symbol, day)
+        if path is None or not path.exists():
+            return None
+        return path.read_bytes()
+
+    def _cache_put(self, symbol: str, day, raw: bytes, now: datetime) -> None:
+        path = self._cache_path(symbol, day)
+        # Skip today and yesterday: their files may not be final yet.
+        if path is None or day >= (now - timedelta(days=1)).date():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(raw)
+        os.replace(tmp, path)
 
     @classmethod
     def decode(cls, raw: bytes, day_start: datetime, scale: int, symbol: str = "") -> list[Bar]:

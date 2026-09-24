@@ -281,13 +281,18 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def _fetch_feed(cfg: Config, provider: str):
+def _dukascopy_progress(symbol: str, done: int, total: int, retries: int) -> None:
+    note = f" ({retries} retries while the server throttled)" if retries else ""
+    log.info("%s: %d/%d days%s", symbol, done, total, note)
+
+
+def _fetch_feed(cfg: Config, provider: str, out: Path):
     if provider == "dukascopy":
-        log.info("Dukascopy keeps one file per pair per day; about 1-2 minutes per pair for a year")
-        return DukascopyFeed(
-            cfg.timeframe_minutes,
-            progress=lambda sym, done, total: log.info("%s: %d/%d days downloaded", sym, done, total),
+        log.info(
+            "Dukascopy keeps one file per pair per day and throttles fast downloads, so a year takes "
+            "a few minutes per pair. Finished days are cached; rerunning only fetches what is missing."
         )
+        return DukascopyFeed(cfg.timeframe_minutes, cache_dir=out / ".cache" / "dukascopy", progress=_dukascopy_progress)
     return _live_feed(cfg)
 
 
@@ -301,9 +306,9 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     if provider not in ("yahoo", "oanda", "dukascopy"):
         print("fetch needs a data source: --provider yahoo, dukascopy or oanda", file=sys.stderr)
         return 2
-    feed = _fetch_feed(cfg, provider)
-    now = datetime.now(timezone.utc)
     out = Path(args.out)
+    feed = _fetch_feed(cfg, provider, out)
+    now = datetime.now(timezone.utc)
     failed = []
     count = args.days * 1440 // cfg.timeframe_minutes
     cutoff = now - timedelta(days=args.days)

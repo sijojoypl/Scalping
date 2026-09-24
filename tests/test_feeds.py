@@ -331,19 +331,84 @@ def test_dukascopy_fetch_walks_days_with_zero_based_months():
     assert bars[0].open == pytest.approx(170.0)  # JPY pairs use 0.001 points
     assert bars[-1].time == datetime(2026, 2, 2, 9, 55, tzinfo=UTC)
     assert len(bars) == 240
-    assert progress[-1] == ("CHFJPY", len(session.urls), len(session.urls))
+    assert progress[-1] == ("CHFJPY", len(session.urls), len(session.urls), 0)
 
 
-def test_dukascopy_gives_up_on_a_dead_connection():
+class FakeTime:
+    """A clock that only moves when something sleeps, so backoff costs no real time."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def now(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += seconds
+
+
+def day_candles():
+    return bi5([(60 * i, 88000, 88001, 87990, 88010, 1.0) for i in range(60)])
+
+
+class ThrottlingSession:
+    """Answers 503 to the first ``throttle`` requests and to every request for ``bad_days``."""
+
+    headers = {}
+
+    def __init__(self, throttle=0, bad_days=()):
+        self.throttle, self.bad_days, self.urls = throttle, set(bad_days), []
+
+    def get(self, url, params=None, timeout=None):
+        self.urls.append(url)
+        if len(self.urls) <= self.throttle or any(f"/{d}/" in url for d in self.bad_days):
+            return FakeResponse({}, 503)
+        return FakeResponse({}, 200, day_candles())
+
+
+def test_dukascopy_pauses_everyone_when_throttled_then_carries_on():
+    clock = FakeTime()
+    session = ThrottlingSession(throttle=3)
+    feed = DukascopyFeed(5, session=session, workers=1, sleep=clock.sleep, clock=clock.now)
+    bars = feed.fetch_closed("USDCHF", 1500, datetime(2026, 2, 6, 12, tzinfo=UTC))
+    assert bars and feed.retry_count == 3
+    assert clock.t >= 5 + 10 + 20  # backoff grew with each push-back
+
+
+def test_dukascopy_keeps_going_when_a_day_keeps_failing(caplog):
+    clock = FakeTime()
+    session = ThrottlingSession(bad_days=["2026/01/03"])  # 3 Feb 2026 (months are 0-based)
+    feed = DukascopyFeed(5, session=session, workers=2, retries=1, sleep=clock.sleep, clock=clock.now)
+    with caplog.at_level("WARNING"):
+        bars = feed.fetch_closed("USDCHF", 1500, datetime(2026, 2, 6, 12, tzinfo=UTC))
+    assert bars
+    assert not any(b.time.date().isoformat() == "2026-02-03" for b in bars)
+    assert "1 day(s) could not be downloaded (2026-02-03)" in caplog.text
+
+
+def test_dukascopy_gives_up_when_nothing_arrives():
     class Dead:
         headers = {}
 
         def get(self, url, params=None, timeout=None):
-            raise ConnectionError("refused")
+            raise TimeoutError("Operation timed out after 30000 milliseconds")
 
-    feed = DukascopyFeed(5, session=Dead(), sleep=lambda s: None, workers=2)
-    with pytest.raises(FeedError, match="after 4 tries: refused"):
+    clock = FakeTime()
+    feed = DukascopyFeed(5, session=Dead(), workers=2, retries=1, sleep=clock.sleep, clock=clock.now)
+    with pytest.raises(FeedError, match="sent no data for USDCHF: .*timed out"):
         feed.fetch_closed("USDCHF", 300, datetime(2026, 2, 4, tzinfo=UTC))
+
+
+def test_dukascopy_reuses_cached_days(tmp_path):
+    now = datetime(2026, 2, 13, 12, tzinfo=UTC)
+    first = ThrottlingSession()
+    DukascopyFeed(5, session=first, cache_dir=tmp_path).fetch_closed("USDCHF", 3000, now)
+    second = ThrottlingSession()
+    bars = DukascopyFeed(5, session=second, cache_dir=tmp_path).fetch_closed("USDCHF", 3000, now)
+    assert bars
+    # Only the last two days (possibly not final yet) are asked for again.
+    assert sorted(u.split("/")[-2] for u in second.urls) == ["12", "13"]
+    assert len(first.urls) > len(second.urls)
 
 
 def test_find_csv_accepts_tradingview_export_names(tmp_path):

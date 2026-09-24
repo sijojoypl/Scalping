@@ -60,7 +60,7 @@ python -m scalper backtest --days 30    # trade the last 30 days; the 15 days be
 | command                                  | source                                                     |
 |------------------------------------------|------------------------------------------------------------|
 | `python -m scalper fetch`                | Yahoo (default). Free, but Yahoo sometimes refuses with HTTP 429, especially from servers and VPSs. |
-| `python -m scalper fetch --provider dukascopy` | Dukascopy's free historical data, no key. One file per pair per day, downloaded 6 at a time: about 1-2 minutes per pair for a year. Prices are bid, not mid. |
+| `python -m scalper fetch --provider dukascopy` | Dukascopy's free historical data, no key. One file per pair per day; Dukascopy throttles fast downloads, so a year takes a few minutes per pair. Finished days are cached in `data/.cache`, so if some days fail, running the same command again only fetches those. Prices are bid, not mid. |
 | `python -m scalper fetch --provider oanda`     | OANDA, needs `OANDA_API_TOKEN` (free practice account). |
 
 Useful variations:
