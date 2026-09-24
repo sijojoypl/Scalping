@@ -138,6 +138,10 @@ class Config:
         if self.account.sizing_basis not in ("initial", "equity"):
             raise ConfigError("account.sizing_basis must be 'initial' or 'equity'")
         s = self.strategy
+        try:
+            SessionWindow.parse(s.session, s.session_timezone)
+        except ValueError as exc:
+            raise ConfigError(f"strategy.session: {exc}") from exc
         if len(s.ema_lengths) != 5 or any(n < 1 for n in s.ema_lengths):
             raise ConfigError("strategy.ema_lengths needs five positive periods")
         for name in ("rsi_length", "rsi_ma_length", "atr_length"):

@@ -30,6 +30,7 @@ from scalper.report import (
     per_symbol_table,
 )
 from scalper.runner import JOURNAL_FILE, STATE_FILE, PaperTrader
+from scalper.session import SessionWindow
 from scalper.storage import read_trades, write_trades
 
 DEFAULT_CONFIG = "config/paper.yaml"
@@ -142,12 +143,21 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     ratios = args.min_stop_spread or []
     if len(ratios) == 1:
         cfg.risk.min_stop_spread_ratio = ratios[0]
+    sessions = args.session or []
+    if len(sessions) == 1:
+        cfg.strategy.session = sessions[0]
     if args.no_entry:
         none = [w.lower() for w in args.no_entry] == ["none"]
         cfg.risk.no_entry_windows = [] if none else list(args.no_entry)
     cfg.validate()
-    if len(ratios) > 1 and args.trades_out:
-        raise ConfigError("--trades-out needs a single --min-stop-spread value")
+    for session in sessions:
+        try:
+            SessionWindow.parse(session, cfg.strategy.session_timezone)
+        except ValueError as exc:
+            raise ConfigError(f"--session: {exc}") from exc
+    grid = len(ratios) > 1 or len(sessions) > 1
+    if grid and args.trades_out:
+        raise ConfigError("--trades-out needs a single --session and --min-stop-spread value")
     setup_logging(args.log_level or "WARNING")
 
     if args.synthetic:
@@ -190,20 +200,28 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     print(f"Backtest: {', '.join(cfg.symbols)} M{cfg.timeframe_minutes} on {source}{costs_note}")
     print(f"Period  : {window_start:%Y-%m-%d %H:%M} -> {last:%Y-%m-%d %H:%M} UTC")
 
-    if len(ratios) > 1:
-        return _sweep(cfg, data, start, not args.no_costs, ratios, run_backtest, copy)
+    days = _weekdays(window_start, last)
+    if grid:
+        return _sweep(
+            cfg, data, start, not args.no_costs, days,
+            ratios or [cfg.risk.min_stop_spread_ratio or 0],
+            sessions or [cfg.strategy.session],
+            run_backtest, copy,
+        )
 
     result = run_backtest(cfg, data, start, charge_costs=not args.no_costs)
     print(
         f"Bars    : {result.bars_processed:,}"
         + (f" (+{result.warmup_bars:,} warm-up bars before)" if result.warmup_bars else "")
     )
+    print(f"Session : {cfg.strategy.session} ({cfg.strategy.session_timezone})")
     ratio = cfg.risk.min_stop_spread_ratio
     if ratio:
         print(f"Filter  : skip signals whose stop is under {ratio:g}x the spread")
     if cfg.risk.no_entry_windows:
         print(f"No entry: {', '.join(cfg.risk.no_entry_windows)} ({cfg.strategy.session_timezone})")
     print(format_stats(result.stats, cfg.account.currency))
+    print(f"  {'Trades per day':<18}  {result.stats.trades / days:.2f} (over {days} weekdays)")
     print(
         per_symbol_table(
             result.trades,
@@ -236,25 +254,37 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     return 0
 
 
-def _sweep(cfg, data, start, charge_costs, ratios, run_backtest, copy) -> int:
-    """One backtest per --min-stop-spread value, summarised in one table."""
-    cur = cfg.account.currency
-    print("\nStop filter sweep (0 = off). Look for a range of values that all do well,")
-    print("not the single best row: one lucky setting is usually noise.\n")
-    print(f"  {'Min stop':>9} {'Trades':>7} {'Win %':>7} {'PF':>7} {'Net ' + cur:>13} {'Net %':>7} {'Max DD %':>9}")
-    for ratio in ratios:
-        run_cfg = copy.deepcopy(cfg)
-        run_cfg.risk.min_stop_spread_ratio = ratio
-        run_cfg.validate()
-        st = run_backtest(run_cfg, data, start, charge_costs=charge_costs).stats
-        label = "off" if not ratio else f"{ratio:g}x spr"
-        pf = "n/a" if st.profit_factor is None else f"{st.profit_factor:.2f}"
-        win = "n/a" if st.win_rate is None else f"{st.win_rate:.1f}"
-        print(
-            f"  {label:>9} {st.trades:>7} {win:>7} {pf:>7} {st.net_profit:>13,.2f} "
-            f"{st.net_profit_pct:>6.2f}% {st.max_drawdown_pct:>8.2f}%",
-            flush=True,
-        )
+def _weekdays(first: datetime, last: datetime) -> int:
+    """Monday-Friday dates from ``first`` to ``last``, inclusive (at least 1)."""
+    day, end, n = first.date(), last.date(), 0
+    while day <= end:
+        n += day.weekday() < 5
+        day += timedelta(days=1)
+    return max(n, 1)
+
+
+def _sweep(cfg, data, start, charge_costs, days, ratios, sessions, run_backtest, copy) -> int:
+    """One backtest per (session, --min-stop-spread) pair, summarised in one table."""
+    print(f"\nSweep over {len(sessions)} session(s) x {len(ratios)} stop filter(s) "
+          f"(sessions in {cfg.strategy.session_timezone}; 0 = filter off).")
+    print("Look for settings whose neighbours also do well, not the single best row:")
+    print("one lucky setting is usually noise. Then confirm it on data it was not picked on.\n")
+    print(f"  {'Session':<10} {'Min stop':>9} {'Trades':>7} {'/day':>5} {'Win %':>6} {'PF':>6} {'Net %':>8} {'Max DD %':>9}")
+    for session in sessions:
+        for ratio in ratios:
+            run_cfg = copy.deepcopy(cfg)
+            run_cfg.strategy.session = session
+            run_cfg.risk.min_stop_spread_ratio = ratio
+            run_cfg.validate()
+            st = run_backtest(run_cfg, data, start, charge_costs=charge_costs).stats
+            label = "off" if not ratio else f"{ratio:g}x spr"
+            pf = "n/a" if st.profit_factor is None else f"{st.profit_factor:.2f}"
+            win = "n/a" if st.win_rate is None else f"{st.win_rate:.1f}"
+            print(
+                f"  {session:<10} {label:>9} {st.trades:>7} {st.trades / days:>5.1f} {win:>6} {pf:>6} "
+                f"{st.net_profit_pct:>7.1f}% {st.max_drawdown_pct:>8.1f}%",
+                flush=True,
+            )
     return 0
 
 
@@ -317,6 +347,8 @@ def _fetch_feed(cfg: Config, provider: str, out: Path):
 
 def cmd_fetch(args: argparse.Namespace) -> int:
     cfg = _config(args)
+    if args.symbols:
+        cfg.symbols = args.symbols
     provider = args.provider or cfg.feed.provider
     if provider in ("yahoo", "oanda"):
         cfg.feed.provider = provider
@@ -397,6 +429,12 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--seed", type=int, default=7, help="synthetic seed (default 7)")
     b.add_argument("--no-costs", action="store_true", help="zero spread/slippage/commission, like TradingView defaults")
     b.add_argument(
+        "--session",
+        nargs="+",
+        metavar="HHMM-HHMM",
+        help="trading window(s) in the session timezone, e.g. 1600-1900 1900-0300; several values are compared",
+    )
+    b.add_argument(
         "--min-stop-spread",
         type=float,
         nargs="+",
@@ -424,6 +462,7 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--provider", choices=["yahoo", "dukascopy", "oanda"], help="data source (default feed.provider)")
     f.add_argument("--days", type=int, default=45, help="calendar days of history (default 45; Yahoo keeps ~59)")
     f.add_argument("--out", default="data", help="output folder (default data)")
+    f.add_argument("--symbols", nargs="+", help="pairs to download instead of the configured ones")
     f.set_defaults(func=cmd_fetch)
 
     r = sub.add_parser("reset", help="start a fresh paper account (old files are backed up)")

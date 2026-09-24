@@ -100,6 +100,19 @@ The shipped `config/paper.yaml` turns both on (`min_stop_spread_ratio: 4`, `no_e
 
 The `--min-stop-spread` and `--no-entry` flags override them for a single backtest (`--min-stop-spread 0` and `--no-entry none` switch them off). A `--no-costs` backtest still applies the filter with the configured spreads, so it takes the same trades as the run with costs.
 
+#### More trades per day
+
+With the original hours and pairs the bot takes well under one trade a day. Longer hours and more pairs raise that; the backtester shows whether it stays profitable. `--session` and `--min-stop-spread` both take several values and every combination goes in one table, with a trades-per-day column:
+
+```bash
+python -m scalper fetch --provider dukascopy --days 365 --symbols EURGBP EURCHF AUDCHF EURCAD AUDNZD NZDCAD
+python -m scalper backtest --days 360 \
+    --symbols USDCHF CHFJPY AUDCAD GBPAUD EURGBP EURCHF AUDCHF EURCAD AUDNZD NZDCAD \
+    --session 1600-1900 1900-0300 1600-0300 0000-2359 --min-stop-spread 0 3 4
+```
+
+Sessions are in New York time; `1900-0300` is the Tokyo session. The no-entry window from the config still applies. Anything that looks good has to pass the same older-half / newer-half check before it means much.
+
 #### Using data exported from TradingView
 
 TradingView can export the candles on a chart as CSV, and the bot reads that format directly. For each of USDCHF, CHFJPY, AUDCAD and GBPAUD, plus USDJPY, USDCAD and AUDUSD (used to convert profits to USD):

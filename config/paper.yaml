@@ -38,6 +38,12 @@ costs:
     CHFJPY: 2.5
     AUDCAD: 2.0
     GBPAUD: 3.0
+    EURGBP: 1.5               # extra pairs you can test with --symbols
+    EURCHF: 2.0
+    AUDCHF: 2.5
+    EURCAD: 2.5
+    AUDNZD: 3.0
+    NZDCAD: 3.0
   slippage_pips: 0.2          # on market entries and stop-loss exits
   commission_per_100k: 0.0    # per side, in account currency
 

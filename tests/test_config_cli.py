@@ -135,11 +135,9 @@ def test_cli_stop_filter_sweep_and_until(tmp_path, capsys):
 
     args = ["backtest", "--data-dir", str(tmp_path), "--days", "20"]
     assert main(args + ["--min-stop-spread", "0", "4", "8"]) == 0
-    out = capsys.readouterr().out
-    rows = [line for line in out.splitlines() if line.strip().startswith(("off", "4x", "8x"))]
-    assert len(rows) == 3
-    trades = [int(r.split()[1] if r.split()[0] == "off" else r.split()[2]) for r in rows]
-    assert trades[0] >= trades[1] >= trades[2]
+    rows = sweep_rows(capsys.readouterr().out)
+    assert [r["filter"] for r in rows] == ["off", "4x", "8x"]
+    assert rows[0]["trades"] >= rows[1]["trades"] >= rows[2]["trades"]
 
     assert main(args + ["--min-stop-spread", "5"]) == 0
     assert "under 5x the spread" in capsys.readouterr().out
@@ -156,3 +154,65 @@ def test_cli_stop_filter_sweep_and_until(tmp_path, capsys):
 
     assert main(args + ["--no-entry", "none"]) == 0
     assert "No entry:" not in capsys.readouterr().out
+
+
+def test_cli_session_grid_and_trades_per_day(tmp_path, capsys):
+    from scalper.feeds import generate_synthetic, save_csv
+
+    symbols = ["USDCHF", "CHFJPY", "AUDCAD", "GBPAUD", "USDJPY", "USDCAD", "AUDUSD"]
+    for s, bars in generate_synthetic(symbols, days=30, seed=3).items():
+        save_csv(tmp_path / f"{s}_M5.csv", bars)
+    args = ["backtest", "--data-dir", str(tmp_path), "--days", "20"]
+
+    assert main(args + ["--session", "1600-1900", "0000-2359", "--min-stop-spread", "0", "4"]) == 0
+    rows = sweep_rows(capsys.readouterr().out)
+    assert [(r["session"], r["filter"]) for r in rows] == [
+        ("1600-1900", "off"), ("1600-1900", "4x"), ("0000-2359", "off"), ("0000-2359", "4x"),
+    ]
+    per_day = {r["session"]: r["per_day"] for r in rows if r["filter"] == "off"}
+    assert per_day["0000-2359"] > per_day["1600-1900"]  # more hours, more trades
+
+    assert main(args + ["--session", "1900-0300"]) == 0
+    out = capsys.readouterr().out
+    assert "Session : 1900-0300" in out and "Trades per day" in out
+
+    assert main(args + ["--session", "19:00-03:00"]) == 2
+
+
+def test_cli_fetch_other_symbols_brings_their_conversion_pairs(tmp_path, monkeypatch):
+    import scalper.cli as cli
+    from scalper.feeds import ReplayFeed, generate_synthetic
+
+    data = generate_synthetic(["EURGBP", "AUDNZD", "GBPUSD", "NZDUSD"], days=10, seed=1)
+    monkeypatch.setattr(cli, "_live_feed", lambda cfg: ReplayFeed(data, 5))
+    monkeypatch.setattr(cli, "datetime", _FrozenDatetime(max(b[-1].time for b in data.values())))
+    assert main(["fetch", "--symbols", "EURGBP", "AUDNZD", "--days", "5", "--out", str(tmp_path)]) == 0
+    assert sorted(p.stem for p in tmp_path.glob("*.csv")) == ["AUDNZD_M5", "EURGBP_M5", "GBPUSD_M5", "NZDUSD_M5"]
+
+
+class _FrozenDatetime:
+    """Stands in for ``datetime`` in scalper.cli so ``now()`` lands on the synthetic data."""
+
+    def __init__(self, moment):
+        from datetime import datetime, timedelta
+
+        self._moment = moment + timedelta(minutes=10)
+        self._real = datetime
+
+    def now(self, tz=None):
+        return self._moment
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def sweep_rows(out):
+    """Parse the sweep table: session, filter, trades and trades per day of each row."""
+    rows = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 7 or "-" not in parts[0] or not parts[0][:4].isdigit():
+            continue
+        i = 2 if parts[1] == "off" else 3  # "4x spr" takes two columns
+        rows.append({"session": parts[0], "filter": parts[1], "trades": int(parts[i]), "per_day": float(parts[i + 1])})
+    return rows
