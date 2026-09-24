@@ -395,7 +395,7 @@ def test_dukascopy_gives_up_when_nothing_arrives():
 
     clock = FakeTime()
     feed = DukascopyFeed(5, session=Dead(), workers=2, retries=1, sleep=clock.sleep, clock=clock.now)
-    with pytest.raises(FeedError, match="sent no data for USDCHF: .*timed out"):
+    with pytest.raises(FeedError, match=r"stopped answering USDCHF \(timed out\).*run the same fetch again"):
         feed.fetch_closed("USDCHF", 300, datetime(2026, 2, 4, tzinfo=UTC))
 
 
@@ -417,3 +417,37 @@ def test_find_csv_accepts_tradingview_export_names(tmp_path):
     assert find_csv(tmp_path, "USDCHF").name == "FX_USDCHF, 5.csv"
     assert find_csv(tmp_path, "CHFJPY").name == "OANDA_CHFJPY, 5.csv"
     assert find_csv(tmp_path, "AUDCAD") is None
+
+
+def test_dukascopy_stops_quickly_when_the_server_blocks_us(tmp_path, caplog):
+    """Many days in, the server starts refusing everything: give up in minutes, keep the cache."""
+    now = datetime(2026, 3, 13, 12, tzinfo=UTC)
+
+    class BlocksAfter:
+        headers = {}
+
+        def __init__(self, good):
+            self.good, self.urls = good, []
+
+        def get(self, url, params=None, timeout=None):
+            self.urls.append(url)
+            if len(self.urls) <= self.good:
+                return FakeResponse({}, 200, day_candles())
+            return FakeResponse({}, 503)
+
+    clock = FakeTime()
+    session = BlocksAfter(good=20)
+    feed = DukascopyFeed(5, session=session, workers=2, cache_dir=tmp_path, sleep=clock.sleep, clock=clock.now)
+    with caplog.at_level("WARNING"), pytest.raises(FeedError, match=r"20 day\(s\) of USDCHF are cached"):
+        feed.fetch_closed("USDCHF", 20_000, now)  # ~70 weekdays wanted
+    assert len(session.urls) <= 20 + feed.max_failures_in_a_row + 2
+    assert clock.t < 15 * 60  # simulated minutes, not hours
+    assert "pausing downloads" in caplog.text
+
+    # Later the block has lifted: only the missing days are fetched.
+    retry = ThrottlingSession()
+    bars = DukascopyFeed(5, session=retry, cache_dir=tmp_path).fetch_closed("USDCHF", 20_000, now)
+    fetched_before = set(session.urls[:20])
+    assert bars and retry.urls
+    assert fetched_before.isdisjoint(retry.urls)  # cached days are not downloaded again
+    assert bars[0].time.date().isoformat() == "2026-01-01"  # and the full range is there

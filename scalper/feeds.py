@@ -318,6 +318,12 @@ class DukascopyFeed:
         self._lock = threading.Lock()
         self._resume_at = -math.inf
         self.retry_count = 0
+        # After this many failed tries in a row with no success in between,
+        # the server is refusing us (usually a temporary block): stop instead
+        # of retrying for hours.
+        self.max_failures_in_a_row = 10
+        self._failures_in_a_row = 0
+        self._blocked: str | None = None
 
     def fetch_closed(self, symbol: str, count: int, now: datetime) -> list[Bar]:
         symbol = normalize_symbol(symbol)
@@ -341,6 +347,7 @@ class DukascopyFeed:
         self.retry_count = 0
         failed: dict = {}
         done = len(files)
+        last_report = self._clock()
         pool = ThreadPoolExecutor(max_workers=self.workers)
         try:
             futures = {pool.submit(self._download, symbol, d): d for d in todo}
@@ -352,11 +359,14 @@ class DukascopyFeed:
                 except FeedError as exc:
                     failed[d] = exc
                 done += 1
-                if self._progress and (done % 25 == 0 or done == len(days)):
+                due = done % 25 == 0 or done == len(days) or self._clock() - last_report >= 30
+                if self._progress and due:
                     self._progress(symbol, done, len(days), self.retry_count)
+                    last_report = self._clock()
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
 
+        self._raise_if_blocked(symbol, days)
         for d in sorted(failed):  # one more, slower pass for days that kept failing
             try:
                 files[d] = self._download(symbol, d)
@@ -364,6 +374,7 @@ class DukascopyFeed:
                 del failed[d]
             except FeedError as exc:
                 failed[d] = exc
+        self._raise_if_blocked(symbol, days)
         if failed and not any(files.values()):
             raise FeedError(f"Dukascopy sent no data for {symbol}: {next(iter(failed.values()))}")
         if failed:
@@ -381,6 +392,16 @@ class DukascopyFeed:
         bars = aggregate(minutes, self.tf_minutes)
         return [b for b in bars if is_closed(b.time, self.tf, now)][-count:]
 
+    def _raise_if_blocked(self, symbol: str, days: list) -> None:
+        if not self._blocked:
+            return
+        kept = sum(1 for d in days if self._cache_get(symbol, d) is not None)
+        raise FeedError(
+            f"Dukascopy stopped answering {symbol} ({self._blocked}). This is usually a "
+            f"temporary block after many downloads: wait 20-30 minutes, then run the same "
+            f"fetch again. {kept} day(s) of {symbol} are cached and will not be downloaded again."
+        )
+
     # ------------------------------------------------------------ download
     def _session(self):
         if not hasattr(self._local, "session"):
@@ -395,16 +416,29 @@ class DukascopyFeed:
                 return
             self._sleep(wait)
 
-    def _push_back(self, attempt: int) -> None:
+    def _push_back(self, attempt: int, problem: str) -> None:
         with self._lock:
             self.retry_count += 1
+            self._failures_in_a_row += 1
+            if self._failures_in_a_row >= self.max_failures_in_a_row:
+                self._blocked = problem
+                return
             pause = self.backoff * 2 ** min(attempt, 4)
-            self._resume_at = max(self._resume_at, self._clock() + pause)
+            until = self._clock() + pause
+            if pause >= 20 and until > self._resume_at + 1:
+                log.warning("Dukascopy is throttling (%s); pausing downloads for %.0f s", problem, pause)
+            self._resume_at = max(self._resume_at, until)
+
+    def _answered(self) -> None:
+        with self._lock:
+            self._failures_in_a_row = 0
 
     def _download(self, symbol: str, day) -> bytes:
         url = self.URL.format(symbol=symbol, y=day.year, m=day.month - 1, d=day.day)  # months are 0-based
         problem = ""
         for attempt in range(self.retries + 1):
+            if self._blocked:
+                raise FeedError(f"Dukascopy stopped answering: {self._blocked}")
             if attempt:
                 log.debug("Dukascopy %s %s: %s, retrying", symbol, day, problem)
             self._wait_turn()
@@ -412,14 +446,15 @@ class DukascopyFeed:
                 resp = self._session().get(url, timeout=self.timeout)
             except OSError as exc:
                 problem = "timed out" if "timed out" in str(exc).lower() else (str(exc) or type(exc).__name__)
-                self._push_back(attempt)
+                self._push_back(attempt, problem)
                 continue
-            if resp.status_code == 404:
-                return b""  # no file for this day (holiday, or not published yet)
             if resp.status_code == 429 or resp.status_code >= 500:
                 problem = f"HTTP {resp.status_code}"
-                self._push_back(attempt)
+                self._push_back(attempt, problem)
                 continue
+            self._answered()
+            if resp.status_code == 404:
+                return b""  # no file for this day (holiday, or not published yet)
             if resp.status_code >= 400:
                 raise FeedError(f"Dukascopy request for {symbol} {day} failed: HTTP {resp.status_code}")
             return resp.content
