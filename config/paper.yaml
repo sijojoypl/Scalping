@@ -1,0 +1,71 @@
+# Reverse RSI scalper: paper trading config.
+#
+# PAPER is the only mode. Orders are filled by a simulated broker; nothing
+# is ever sent to a real account.
+mode: PAPER
+
+# Pairs from the README; M5 is the timeframe the strategy was tested on.
+symbols: [USDCHF, CHFJPY, AUDCAD, GBPAUD]
+timeframe_minutes: 5
+
+strategy:                     # Pine inputs, same defaults as the .pine file
+  rsi_length: 20
+  rsi_ma_length: 5
+  upper_limit: 55             # short when RSI SMA crosses above this...
+  lower_limit: 49             # ...long when it crosses below this
+  ema_lengths: [4, 10, 15, 19, 25]
+  session: "1600-1900"        # quiet hours, Sydney session
+  session_timezone: America/New_York   # timezone TradingView uses for FXCM/OANDA forex
+  atr_length: 14
+  atr_mult: 2.0
+  profit_multiple: 1.5        # TP = 1.5x the stop distance
+  sl_multiple: 1.0            # stop = ATR(14) * atr_mult * sl_multiple
+  risk_per_trade: 0.01        # 1% of capital at risk per trade
+
+account:
+  currency: USD
+  initial_capital: 50000
+  sizing_basis: initial       # "initial" = Pine behaviour, "equity" = compounding
+
+costs:
+  # Full spread in pips, paid half on entry and half on exit. The TradingView
+  # backtest in the README had no costs; run `backtest --no-costs` to match it.
+  # The session window spans the 17:00 New York rollover, when real spreads
+  # widen, so these are not generous.
+  spread_pips:
+    default: 2.0
+    USDCHF: 1.5
+    CHFJPY: 2.5
+    AUDCAD: 2.0
+    GBPAUD: 3.0
+  slippage_pips: 0.2          # on market entries and stop-loss exits
+  commission_per_100k: 0.0    # per side, in account currency
+
+risk:                         # optional guard rails, not part of the Pine script
+  max_open_positions: 4
+  max_daily_loss_pct: null    # e.g. 3.0 blocks new entries after a 3% losing day
+
+feed:
+  provider: yahoo             # yahoo (free, no key) | oanda (needs token) | csv | synthetic
+  history_bars: 500           # warm-up bars loaded at start-up
+  poll_delay_seconds: 15      # wait this long after each bar close before polling
+  request_timeout: 20
+  oanda:
+    environment: practice     # candles only; the bot never sends orders to OANDA
+    token_env: OANDA_API_TOKEN
+  data_dir: data              # csv provider: one CSV per symbol, e.g. data/USDCHF_M5.csv
+  csv_timezone: UTC
+  synthetic_days: 30
+  synthetic_seed: 7
+
+# Used only until a live quote for the conversion pair arrives.
+# Value = USD per 1 unit of the currency.
+fx_fallback_rates:
+  CHF: 1.13
+  JPY: 0.0067
+  CAD: 0.72
+  AUD: 0.66
+
+state_dir: state
+log_dir: logs
+log_level: INFO
