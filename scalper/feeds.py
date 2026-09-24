@@ -366,15 +366,18 @@ class DukascopyFeed:
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
 
-        self._raise_if_blocked(symbol, days)
-        for d in sorted(failed):  # one more, slower pass for days that kept failing
-            try:
-                files[d] = self._download(symbol, d)
-                self._cache_put(symbol, d, files[d], now)
-                del failed[d]
-            except FeedError as exc:
-                failed[d] = exc
-        self._raise_if_blocked(symbol, days)
+        if self._check_block(symbol, days, files, now):
+            failed = {}
+        else:
+            for d in sorted(failed):  # one more, slower pass for days that kept failing
+                try:
+                    files[d] = self._download(symbol, d)
+                    self._cache_put(symbol, d, files[d], now)
+                    del failed[d]
+                except FeedError as exc:
+                    failed[d] = exc
+            if self._check_block(symbol, days, files, now):
+                failed = {}
         if failed and not any(files.values()):
             raise FeedError(f"Dukascopy sent no data for {symbol}: {next(iter(failed.values()))}")
         if failed:
@@ -391,6 +394,25 @@ class DukascopyFeed:
                 minutes.extend(self.decode(files[d], start, scale, symbol))
         bars = aggregate(minutes, self.tf_minutes)
         return [b for b in bars if is_closed(b.time, self.tf, now)][-count:]
+
+    def _check_block(self, symbol: str, days: list, files: dict, now: datetime) -> bool:
+        """After a block: carry on if only today/yesterday are missing, else raise.
+
+        Returns False when the server is not blocking us.
+        """
+        if not self._blocked:
+            return False
+        recent = (now - timedelta(days=1)).date()
+        missing = [d for d in days if d not in files]
+        if all(d >= recent for d in missing):
+            if missing:
+                log.warning(
+                    "%s: Dukascopy stopped answering, so the last %d day(s) are missing; "
+                    "everything older came from the cache.", symbol, len(missing),
+                )
+            return True
+        self._raise_if_blocked(symbol, days)
+        return False  # not reached
 
     def _raise_if_blocked(self, symbol: str, days: list) -> None:
         if not self._blocked:

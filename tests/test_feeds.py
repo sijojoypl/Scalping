@@ -451,3 +451,29 @@ def test_dukascopy_stops_quickly_when_the_server_blocks_us(tmp_path, caplog):
     assert bars and retry.urls
     assert fetched_before.isdisjoint(retry.urls)  # cached days are not downloaded again
     assert bars[0].time.date().isoformat() == "2026-01-01"  # and the full range is there
+
+
+def test_dukascopy_block_keeps_pairs_missing_only_today_and_yesterday(tmp_path, caplog):
+    now = datetime(2026, 3, 13, 12, tzinfo=UTC)
+    # Fill the cache with a full download first...
+    DukascopyFeed(5, session=ThrottlingSession(), cache_dir=tmp_path).fetch_closed("USDCHF", 3000, now)
+
+    class AlwaysBusy:
+        headers = {}
+
+        def __init__(self):
+            self.urls = []
+
+        def get(self, url, params=None, timeout=None):
+            self.urls.append(url)
+            return FakeResponse({}, 503)
+
+    # ...then the server blocks us: the uncached last two days fail, the rest is kept.
+    clock = FakeTime()
+    busy = AlwaysBusy()
+    feed = DukascopyFeed(5, session=busy, cache_dir=tmp_path, sleep=clock.sleep, clock=clock.now)
+    with caplog.at_level("WARNING"):
+        bars = feed.fetch_closed("USDCHF", 3000, now)
+    assert bars and bars[-1].time.date().isoformat() == "2026-03-11"
+    assert {u.split("/")[-2] for u in busy.urls} == {"12", "13"}
+    assert "the last 2 day(s) are missing" in caplog.text
