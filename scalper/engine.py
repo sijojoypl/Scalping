@@ -41,7 +41,7 @@ class Engine:
         self.rates = rates
         self.on_trade = on_trade
         self.instruments = {s: Instrument.from_symbol(s) for s in config.symbols}
-        self.strategies = {s: ReverseRSIStrategy(config.strategy, i) for s, i in self.instruments.items()}
+        self.strategies = {s: make_strategy(config, i) for s, i in self.instruments.items()}
         self.aux_symbols = rates.required_aux(config.symbols)
         tz = config.strategy.session_timezone
         self.no_entry = [SessionWindow.parse(f"{w}:1234567", tz) for w in config.risk.no_entry_windows]
@@ -86,6 +86,14 @@ class Engine:
                 self.on_trade(event.trade)
         snap = strategy.update(bar)
         self.last_snapshot[symbol] = snap
+        position = self.broker.positions.get(symbol)
+        if position is not None and strategy.should_flatten(bar, position):
+            event = self.broker.close_at_market(symbol, bar.time, bar.close, "TIME")
+            if event is not None:
+                self._log_fill(event)
+                events.append(event)
+                if event.trade is not None and self.on_trade is not None:
+                    self.on_trade(event.trade)
         if snap.signal is not None:
             self._on_signal(symbol, bar, snap, allow_entries)
         return events
@@ -104,10 +112,7 @@ class Engine:
         inst = self.instruments[symbol]
         assert snap.signal is not None and snap.risk_distance is not None
         self.stats["signals"] += 1
-        desc = (
-            f"{symbol} {snap.signal.value} signal @ {inst.fmt(bar.close)} "
-            f"(rsi_ma {snap.rsi_ma:.2f}, atr {inst.fmt(snap.atr or 0)})"
-        )
+        desc = f"{symbol} {snap.signal.value} signal @ {inst.fmt(bar.close)} ({snap.note})"
 
         skip = self._entry_block_reason(symbol, bar, allow_entries, snap.risk_distance)
         if skip:
@@ -131,7 +136,7 @@ class Engine:
             if self.config.account.sizing_basis == "initial"
             else self.broker.balance
         )
-        risk_amount = capital * self.config.strategy.risk_per_trade
+        risk_amount = capital * self.config.risk_per_trade
         qty = pine_round(risk_amount / snap.risk_distance / quote_rate)
         if qty <= 0:
             self.stats["skipped: zero size"] += 1
@@ -204,6 +209,15 @@ class Engine:
     # ------------------------------------------------------------- reporting
     def marks(self) -> dict[str, float]:
         return {s: p for s, p in self.last_close.items() if s in self.strategies}
+
+
+def make_strategy(config: Config, instrument: Instrument):
+    if config.strategy_name == "london_breakout":
+        from scalper.breakout import LondonBreakoutStrategy
+
+        spread = config.costs.spread_for(instrument.symbol)
+        return LondonBreakoutStrategy(config.breakout, instrument, spread, config.timeframe_minutes)
+    return ReverseRSIStrategy(config.strategy, instrument)
 
 
 def build_engine(

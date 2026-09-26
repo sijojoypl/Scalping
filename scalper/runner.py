@@ -227,11 +227,8 @@ class PaperTrader:
         feed = type(self.feed).__name__
         log.info("=" * 68)
         log.info("Reverse RSI scalper v%s  |  MODE: PAPER (simulated fills, no real orders)", __version__)
-        log.info(
-            "symbols %s  |  M%d  |  session %s %s  |  feed %s",
-            ",".join(self.config.symbols), self.config.timeframe_minutes,
-            self.config.strategy.session, self.config.strategy.session_timezone, feed,
-        )
+        log.info("symbols %s  |  M%d  |  feed %s", ",".join(self.config.symbols), self.config.timeframe_minutes, feed)
+        log.info("strategy %s", self.config.describe_strategy())
         if self.engine.aux_symbols:
             log.info("conversion pairs: %s", ", ".join(self.engine.aux_symbols))
         log.info("=" * 68)

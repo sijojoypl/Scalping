@@ -707,7 +707,7 @@ def load_csv_dir(data_dir: str | Path, symbols: Iterable[str], tz_name: str = "U
 _LEVELS = {
     "USDCHF": 0.88, "CHFJPY": 170.0, "AUDCAD": 0.905, "GBPAUD": 2.02,
     "USDJPY": 150.0, "USDCAD": 1.37, "AUDUSD": 0.66, "GBPUSD": 1.30,
-    "EURUSD": 1.10, "NZDUSD": 0.60, "EURCHF": 0.95,
+    "EURUSD": 1.10, "NZDUSD": 0.60, "EURCHF": 0.95, "EURJPY": 162.0, "GBPJPY": 195.0,
 }
 _NY = ZoneInfo("America/New_York")
 

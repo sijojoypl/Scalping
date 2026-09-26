@@ -49,6 +49,7 @@ class Snapshot:
     risk_distance: float | None
     stop_loss: float | None
     take_profit: float | None
+    note: str = ""
 
 
 class ReverseRSIStrategy:
@@ -123,7 +124,11 @@ class ReverseRSIStrategy:
             risk_distance=risk,
             stop_loss=stop,
             take_profit=target,
+            note=f"rsi_ma {rsi_ma:.2f}, atr {self.instrument.fmt(atr)}" if signal else "",
         )
+
+    def should_flatten(self, bar: Bar, position) -> bool:
+        return False  # exits only at stop loss or take profit, as in the Pine script
 
     def _blackout(self, moment: datetime) -> bool:
         if "CHF" not in (self.instrument.base, self.instrument.quote):

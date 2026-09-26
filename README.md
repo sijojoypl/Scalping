@@ -113,6 +113,25 @@ python -m scalper backtest --days 360 \
 
 Sessions are in New York time; `1900-0300` is the Tokyo session. The no-entry window from the config still applies. Anything that looks good has to pass the same older-half / newer-half check before it means much.
 
+### London breakout (3-4 trades a day)
+
+Reverse RSI only works in a quiet three-hour window, so it trades well under once a day. `config/breakout.yaml` runs a second strategy built for the busy London morning on tight-spread majors (EURUSD, GBPUSD, USDJPY, EURJPY, GBPJPY, USDCHF):
+
+1. The overnight range (00:00-07:00 London time) sets each pair's high and low.
+2. Between 07:00 and 10:00 the first 5-minute close beyond the range (plus 10% of its height) is a signal, long above and short below. One per pair per day.
+3. Stop at the middle of the range, target 1x the risk, and anything still open is closed at 16:00 London.
+
+It uses the same paper broker, backtester and data, and keeps its own paper account in `state/breakout`:
+
+```bash
+python -m scalper -c config/breakout.yaml fetch --provider dukascopy --days 365
+python -m scalper -c config/breakout.yaml backtest --days 360
+python -m scalper -c config/breakout.yaml backtest --days 360 --set breakout.profit_multiple=1,1.5,2 breakout.stop=mid,opposite
+python -m scalper -c config/breakout.yaml paper
+```
+
+`--set` works for any setting (dotted path, comma-separated values) and every combination goes in one table. As with Reverse RSI, confirm a setting on data it was not picked on (`--until`) before trusting it.
+
 #### Using data exported from TradingView
 
 TradingView can export the candles on a chart as CSV, and the bot reads that format directly. For each of USDCHF, CHFJPY, AUDCAD and GBPAUD, plus USDJPY, USDCAD and AUDUSD (used to convert profits to USD):

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import itertools
 import logging
 import logging.handlers
 import shutil
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import yaml
 
 from scalper.clock import RealClock, SimClock
 from scalper.config import Config, ConfigError, load_config
@@ -149,15 +153,34 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     if args.no_entry:
         none = [w.lower() for w in args.no_entry] == ["none"]
         cfg.risk.no_entry_windows = [] if none else list(args.no_entry)
+    sets = [_parse_set(item) for item in args.set or []]
+    for path, values in sets:
+        if len(values) == 1:
+            _assign(cfg, path, values[0])
     cfg.validate()
+    if sessions and cfg.strategy_name != "reverse_rsi":
+        raise ConfigError("--session is for reverse_rsi; for london_breakout use --set breakout.entry_window=...")
     for session in sessions:
         try:
             SessionWindow.parse(session, cfg.strategy.session_timezone)
         except ValueError as exc:
             raise ConfigError(f"--session: {exc}") from exc
-    grid = len(ratios) > 1 or len(sessions) > 1
-    if grid and args.trades_out:
-        raise ConfigError("--trades-out needs a single --session and --min-stop-spread value")
+
+    dims: list[tuple[str, list[tuple[str, object]]]] = []
+    if len(sessions) > 1:
+        dims.append(("Session", [(v, _setter("strategy.session", v)) for v in sessions]))
+    if len(ratios) > 1:
+        dims.append(("Filter", [("off" if not r else f"{r:g}x", _setter("risk.min_stop_spread_ratio", r)) for r in ratios]))
+    for path, values in sets:
+        if len(values) > 1:
+            dims.append((path.split(".")[-1], [(_label(v), _setter(path, v)) for v in values]))
+    for _, options in dims:  # reject a bad value now, not halfway through the sweep
+        for _, apply in options:
+            trial = copy.deepcopy(cfg)
+            apply(trial)
+            trial.validate()
+    if dims and args.trades_out:
+        raise ConfigError("--trades-out needs a single value for every swept setting")
     setup_logging(args.log_level or "WARNING")
 
     if args.synthetic:
@@ -201,20 +224,15 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     print(f"Period  : {window_start:%Y-%m-%d %H:%M} -> {last:%Y-%m-%d %H:%M} UTC")
 
     days = _weekdays(window_start, last)
-    if grid:
-        return _sweep(
-            cfg, data, start, not args.no_costs, days,
-            ratios or [cfg.risk.min_stop_spread_ratio or 0],
-            sessions or [cfg.strategy.session],
-            run_backtest, copy,
-        )
+    if dims:
+        return _sweep(cfg, data, start, not args.no_costs, days, dims, run_backtest, copy)
 
     result = run_backtest(cfg, data, start, charge_costs=not args.no_costs)
     print(
         f"Bars    : {result.bars_processed:,}"
         + (f" (+{result.warmup_bars:,} warm-up bars before)" if result.warmup_bars else "")
     )
-    print(f"Session : {cfg.strategy.session} ({cfg.strategy.session_timezone})")
+    print(f"Strategy: {cfg.describe_strategy()}")
     ratio = cfg.risk.min_stop_spread_ratio
     if ratio:
         print(f"Filter  : skip signals whose stop is under {ratio:g}x the spread")
@@ -234,7 +252,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     table = breakdown_table(
         result.trades,
         cfg.account.initial_capital,
-        cfg.strategy.session_timezone,
+        cfg.active_timezone,
         cfg.timeframe_minutes,
         currency=cfg.account.currency,
     )
@@ -263,32 +281,74 @@ def _weekdays(first: datetime, last: datetime) -> int:
     return max(n, 1)
 
 
-def _sweep(cfg, data, start, charge_costs, days, ratios, sessions, run_backtest, copy) -> int:
-    """One backtest per (session, --min-stop-spread) pair, summarised in one table."""
-    print(f"\nSweep over {len(sessions)} session(s) x {len(ratios)} stop filter(s) "
-          f"(sessions in {cfg.strategy.session_timezone}; 0 = filter off).")
+def _parse_set(item: str) -> tuple[str, list]:
+    """``breakout.profit_multiple=1,1.5,2`` -> ("breakout.profit_multiple", [1, 1.5, 2])."""
+    if "=" not in item:
+        raise ConfigError(f"--set needs path=value[,value...], got {item!r}")
+    path, raw = item.split("=", 1)
+    values = [yaml.safe_load(v) for v in raw.split(",") if v.strip() != ""]
+    if not path or not values:
+        raise ConfigError(f"--set needs path=value[,value...], got {item!r}")
+    return path.strip(), values
+
+
+def _assign(cfg: Config, path: str, value) -> None:
+    obj = cfg
+    parts = path.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part, None)
+        if not dataclasses.is_dataclass(obj):
+            raise ConfigError(f"unknown setting {path!r}")
+    if not dataclasses.is_dataclass(obj) or parts[-1] not in {f.name for f in dataclasses.fields(obj)}:
+        raise ConfigError(f"unknown setting {path!r}")
+    setattr(obj, parts[-1], value)
+
+
+def _setter(path: str, value):
+    return lambda cfg: _assign(cfg, path, value)
+
+
+def _label(value) -> str:
+    return "null" if value is None else str(value).replace(" ", "")
+
+
+def _weekdays(first: datetime, last: datetime) -> int:
+    """Monday-Friday dates from ``first`` to ``last``, inclusive (at least 1)."""
+    day, end, n = first.date(), last.date(), 0
+    while day <= end:
+        n += day.weekday() < 5
+        day += timedelta(days=1)
+    return max(n, 1)
+
+
+def _sweep(cfg, data, start, charge_costs, days, dims, run_backtest, copy) -> int:
+    """One backtest per combination of the swept settings, summarised in one table."""
+    combos = list(itertools.product(*(options for _, options in dims)))
+    print(f"\nSweep over {len(combos)} combination(s). {cfg.describe_strategy()}.")
     print("Look for settings whose neighbours also do well, not the single best row:")
     print("one lucky setting is usually noise. Then confirm it on data it was not picked on.\n")
-    print(f"  {'Session':<10} {'Min stop':>9} {'Trades':>7} {'/day':>5} {'Win %':>6} {'PF':>6} {'Net %':>8} {'Max DD %':>9}")
+    widths = [max(len(name), *(len(label) for label, _ in options)) for name, options in dims]
+    names = " ".join(f"{name:<{w}}" for (name, _), w in zip(dims, widths))
+    print(f"  {names} {'Trades':>7} {'/day':>5} {'Win%':>6} {'PF':>6} {'Net%':>8} {'MaxDD%':>8}")
     quiet = logging.getLogger("scalper")
     level = quiet.level
     try:
-        for n, (session, ratio) in enumerate((s, r) for s in sessions for r in ratios):
+        for n, combo in enumerate(combos):
             if n == 1:
                 # Data warnings (missing conversion pairs, fallback rates) are the
                 # same for every run; show them for the first one only.
                 quiet.setLevel(logging.ERROR)
             run_cfg = copy.deepcopy(cfg)
-            run_cfg.strategy.session = session
-            run_cfg.risk.min_stop_spread_ratio = ratio
+            for _, apply in combo:
+                apply(run_cfg)
             run_cfg.validate()
             st = run_backtest(run_cfg, data, start, charge_costs=charge_costs).stats
-            label = "off" if not ratio else f"{ratio:g}x spr"
+            labels = " ".join(f"{label:<{w}}" for (label, _), w in zip(combo, widths))
             pf = "n/a" if st.profit_factor is None else f"{st.profit_factor:.2f}"
             win = "n/a" if st.win_rate is None else f"{st.win_rate:.1f}"
             print(
-                f"  {session:<10} {label:>9} {st.trades:>7} {st.trades / days:>5.1f} {win:>6} {pf:>6} "
-                f"{st.net_profit_pct:>7.1f}% {st.max_drawdown_pct:>8.1f}%",
+                f"  {labels} {st.trades:>7} {st.trades / days:>5.1f} {win:>6} {pf:>6} "
+                f"{st.net_profit_pct:>7.1f}% {st.max_drawdown_pct:>7.1f}%",
                 flush=True,
             )
     finally:
@@ -441,6 +501,13 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         metavar="HHMM-HHMM",
         help="trading window(s) in the session timezone, e.g. 1600-1900 1900-0300; several values are compared",
+    )
+    b.add_argument(
+        "--set",
+        nargs="+",
+        metavar="PATH=V1,V2",
+        help="override any config setting, e.g. breakout.profit_multiple=1,1.5,2 "
+        "(several values are compared in one table)",
     )
     b.add_argument(
         "--min-stop-spread",

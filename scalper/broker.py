@@ -82,6 +82,14 @@ class PaperBroker:
             events.append(self._close(position, bar.time, level, reason, gapped))
         return events
 
+    def close_at_market(self, symbol: str, when: datetime, price: float, reason: str = "TIME") -> FillEvent | None:
+        """Close an open position at ``price`` (a market order: spread and slippage apply)."""
+        self.pending.pop(symbol, None)
+        pos = self.positions.get(symbol)
+        if pos is None:
+            return None
+        return self._close(pos, when, price, reason, gapped=False)
+
     def _costs(self, inst: Instrument) -> tuple[float, float]:
         half_spread = self.costs.spread_for(inst.symbol) * inst.pip_size / 2.0
         slippage = self.costs.slippage_pips * inst.pip_size
@@ -114,7 +122,7 @@ class PaperBroker:
     def _close(self, pos: Position, when: datetime, level: float, reason: str, gapped: bool) -> FillEvent:
         inst = self.instruments[pos.symbol]
         half_spread, slippage = self._costs(inst)
-        cost = half_spread + (slippage if reason == "SL" else 0.0)
+        cost = half_spread + (0.0 if reason == "TP" else slippage)  # only limit orders skip slippage
         exit_price = level - pos.side.sign * cost
         move = (exit_price - pos.entry_price) * pos.side.sign
         pnl_quote = move * pos.qty

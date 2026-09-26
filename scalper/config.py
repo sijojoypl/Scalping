@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
+from datetime import time
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -19,6 +21,7 @@ from scalper.session import SessionWindow
 SUPPORTED_MODES = ("PAPER",)
 SUPPORTED_TIMEFRAMES = (1, 5, 15, 30, 60)
 FEED_PROVIDERS = ("yahoo", "oanda", "csv", "synthetic")
+STRATEGIES = ("reverse_rsi", "london_breakout")
 
 
 class ConfigError(ValueError):
@@ -42,6 +45,25 @@ class StrategyParams:
     atr_mult: float = 2.0
     profit_multiple: float = 1.5
     sl_multiple: float = 1.0
+    risk_per_trade: float = 0.01
+
+
+@dataclass
+class BreakoutParams:
+    """London breakout: trade the first clean break of the overnight range.
+
+    All times are local to ``timezone`` so they follow London's clock changes.
+    """
+
+    timezone: str = "Europe/London"
+    range_window: str = "0000-0700"  # the Asian-session range is built from these bars
+    entry_window: str = "0700-1000"  # a close outside the range here is a signal
+    exit_time: str = "1600"  # anything still open is closed at this time
+    buffer_frac: float = 0.1  # the close must clear the range by this share of its height
+    stop: str = "mid"  # "mid" = middle of the range, "opposite" = other side of it
+    profit_multiple: float = 1.0  # target = stop distance x this
+    min_range_spreads: float = 10.0  # skip days whose range is under this many spreads
+    trades_per_day: int = 1  # per pair
     risk_per_trade: float = 0.01
 
 
@@ -99,6 +121,7 @@ class FeedConfig:
 @dataclass
 class Config:
     mode: str = "PAPER"
+    strategy_name: str = "reverse_rsi"  # or "london_breakout"
     symbols: list[str] = field(default_factory=lambda: ["USDCHF", "CHFJPY", "AUDCAD", "GBPAUD"])
     timeframe_minutes: int = 5
     strategy: StrategyParams = field(default_factory=StrategyParams)
@@ -106,12 +129,57 @@ class Config:
     costs: CostConfig = field(default_factory=CostConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     feed: FeedConfig = field(default_factory=FeedConfig)
+    breakout: BreakoutParams = field(default_factory=BreakoutParams)
     # Used only when no live price for a conversion pair is available yet.
     # Value = account currency per 1 unit of the currency.
     fx_fallback_rates: dict[str, float] = field(default_factory=dict)
     state_dir: str = "state"
     log_dir: str = "logs"
     log_level: str = "INFO"
+
+    @property
+    def active_timezone(self) -> str:
+        """Timezone the active strategy's clock runs in (for reports)."""
+        return self.breakout.timezone if self.strategy_name == "london_breakout" else self.strategy.session_timezone
+
+    @property
+    def risk_per_trade(self) -> float:
+        return self.breakout.risk_per_trade if self.strategy_name == "london_breakout" else self.strategy.risk_per_trade
+
+    def describe_strategy(self) -> str:
+        if self.strategy_name == "london_breakout":
+            b = self.breakout
+            return (
+                f"london_breakout: range {b.range_window}, entries {b.entry_window}, flat at {b.exit_time} "
+                f"({b.timezone}); stop {b.stop}, target {b.profit_multiple:g}R"
+            )
+        return f"reverse_rsi: session {self.strategy.session} ({self.strategy.session_timezone})"
+
+    def _validate_breakout(self) -> None:
+        b = self.breakout
+        try:
+            ZoneInfo(b.timezone)
+        except Exception as exc:  # zoneinfo raises several types
+            raise ConfigError(f"breakout.timezone: unknown timezone {b.timezone!r}") from exc
+        b.exit_time = _hhmm_text(b.exit_time)
+        try:
+            rng = _window(b.range_window)
+            entry = _window(b.entry_window)
+            exit_t = _hhmm(b.exit_time)
+        except ValueError as exc:
+            raise ConfigError(f"breakout: {exc}") from exc
+        if entry[0] < rng[1]:
+            raise ConfigError("breakout.entry_window must start after range_window ends")
+        if exit_t < entry[1]:
+            raise ConfigError("breakout.exit_time must not be before entry_window ends")
+        if b.stop not in ("mid", "opposite"):
+            raise ConfigError("breakout.stop must be 'mid' or 'opposite'")
+        if b.profit_multiple <= 0 or b.buffer_frac < 0 or b.min_range_spreads < 0:
+            raise ConfigError("breakout: profit_multiple must be positive; buffer_frac and min_range_spreads >= 0")
+        if b.trades_per_day < 1:
+            raise ConfigError("breakout.trades_per_day must be >= 1")
+        if not 0 < b.risk_per_trade <= 0.1:
+            raise ConfigError("breakout.risk_per_trade must be in (0, 0.1]")
 
     def validate(self) -> Config:
         self.mode = self.mode.upper()
@@ -151,6 +219,10 @@ class Config:
             raise ConfigError("strategy.risk_per_trade must be in (0, 0.1] like the Pine input")
         if s.atr_mult <= 0 or s.sl_multiple <= 0 or s.profit_multiple <= 0:
             raise ConfigError("strategy atr_mult, sl_multiple and profit_multiple must be positive")
+        self.strategy_name = self.strategy_name.lower()
+        if self.strategy_name not in STRATEGIES:
+            raise ConfigError(f"strategy_name must be one of {STRATEGIES}")
+        self._validate_breakout()
         self.feed.provider = self.feed.provider.lower()
         if self.feed.provider not in FEED_PROVIDERS:
             raise ConfigError(f"feed.provider must be one of {FEED_PROVIDERS}")
@@ -174,6 +246,30 @@ class Config:
             for k, v in self.costs.spread_pips.items()
         }
         return self
+
+
+def _hhmm_text(value: Any) -> str:
+    """YAML reads 0700 as the number 700; turn it back into "0700"."""
+    return f"{value:04d}" if isinstance(value, int) else str(value)
+
+
+def _hhmm(text: str) -> time:
+    text = _hhmm_text(text)
+    if len(text) != 4 or not text.isdigit():
+        raise ValueError(f"bad time {text!r}; expected HHMM")
+    return time(int(text[:2]), int(text[2:]))
+
+
+def _window(text: str) -> tuple[time, time]:
+    """``"0700-1000"`` -> (07:00, 10:00); the window must not cross midnight."""
+    try:
+        a, b = str(text).split("-")
+        start, end = _hhmm(a), _hhmm(b)
+    except ValueError as exc:
+        raise ValueError(f"bad window {text!r}; expected HHMM-HHMM within one day") from exc
+    if not start < end:
+        raise ValueError(f"window {text!r} must start before it ends, within one day")
+    return start, end
 
 
 def _build(cls: type, data: dict[str, Any], path: str) -> Any:

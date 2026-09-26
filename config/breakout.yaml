@@ -1,0 +1,71 @@
+# London breakout scalper: paper trading config.
+#
+# PAPER is the only mode. Orders are filled by a simulated broker; nothing
+# is ever sent to a real account. This config keeps its own paper account and
+# logs (state/breakout, logs/breakout), separate from the Reverse RSI bot.
+#
+#   python -m scalper -c config/breakout.yaml fetch --provider dukascopy --days 365
+#   python -m scalper -c config/breakout.yaml backtest --days 360
+#   python -m scalper -c config/breakout.yaml paper
+mode: PAPER
+strategy_name: london_breakout
+
+# Liquid majors with tight spreads during London hours.
+symbols: [EURUSD, GBPUSD, USDJPY, EURJPY, GBPJPY, USDCHF]
+timeframe_minutes: 5
+
+breakout:
+  timezone: Europe/London       # all times below are London time, summer time included
+  range_window: "0000-0700"     # overnight (Asian session) high and low
+  entry_window: "0700-1000"     # first 5-minute close outside the range is the signal
+  exit_time: "1600"             # anything still open is closed here
+  buffer_frac: 0.1              # close must clear the range by 10% of its height
+  stop: mid                     # mid = middle of the range, opposite = far side
+  profit_multiple: 1.0          # target = 1x the stop distance
+  min_range_spreads: 10         # skip days whose range is under 10 spreads
+  trades_per_day: 1             # per pair
+  risk_per_trade: 0.01          # 1% of capital at risk per trade
+
+account:
+  currency: USD
+  initial_capital: 50000
+  sizing_basis: initial
+
+costs:
+  spread_pips:                  # typical London-hours spreads
+    default: 1.5
+    EURUSD: 0.8
+    GBPUSD: 1.2
+    USDJPY: 1.0
+    EURJPY: 1.5
+    GBPJPY: 2.5
+    USDCHF: 1.2
+  slippage_pips: 0.2            # on market entries, stop-loss and time exits
+  commission_per_100k: 0.0
+
+risk:
+  max_open_positions: 6         # these pairs move together on USD news; lower it to cap that
+  max_daily_loss_pct: null
+  min_stop_spread_ratio: null
+  no_entry_windows: []          # (New York time) the 17:00 NY rollover is outside London hours
+
+feed:
+  provider: yahoo
+  history_bars: 500
+  poll_delay_seconds: 15
+  request_timeout: 20
+  oanda:
+    environment: practice
+    token_env: OANDA_API_TOKEN
+  data_dir: data
+  csv_timezone: UTC
+  synthetic_days: 30
+  synthetic_seed: 7
+
+fx_fallback_rates:
+  JPY: 0.0067
+  CHF: 1.13
+
+state_dir: state/breakout
+log_dir: logs/breakout
+log_level: INFO

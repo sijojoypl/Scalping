@@ -174,7 +174,7 @@ def test_cli_session_grid_and_trades_per_day(tmp_path, capsys):
 
     assert main(args + ["--session", "1900-0300"]) == 0
     out = capsys.readouterr().out
-    assert "Session : 1900-0300" in out and "Trades per day" in out
+    assert "session 1900-0300" in out and "Trades per day" in out
 
     assert main(args + ["--session", "19:00-03:00"]) == 2
 
@@ -207,16 +207,19 @@ class _FrozenDatetime:
 
 
 def sweep_rows(out):
-    """Parse the sweep table: session, filter, trades and trades per day of each row."""
-    import re
-
+    """Parse the sweep table into dicts keyed by lower-cased column names."""
+    lines = out.splitlines()
+    head = next(i for i, line in enumerate(lines) if "Trades" in line.split() and "/day" in line.split())
+    names = [n.lower() for n in lines[head].split()]
     rows = []
-    for line in out.splitlines():
+    for line in lines[head + 1:]:
         parts = line.split()
-        if len(parts) < 7 or not re.fullmatch(r"\d{4}-\d{4}", parts[0]):  # a session like 1600-1900
+        if len(parts) != len(names) or not parts[names.index("trades")].isdigit():
             continue
-        i = 2 if parts[1] == "off" else 3  # "4x spr" takes two columns
-        rows.append({"session": parts[0], "filter": parts[1], "trades": int(parts[i]), "per_day": float(parts[i + 1])})
+        row = dict(zip(names, parts))
+        row["trades"] = int(row["trades"])
+        row["per_day"] = float(row["/day"])
+        rows.append(row)
     return rows
 
 
@@ -230,3 +233,38 @@ def test_sweep_prints_data_warnings_once(tmp_path, capsys):
     out = capsys.readouterr().out
     assert out.count("no data for conversion pair GBPUSD") == 1
     assert len(sweep_rows(out)) == 3
+
+
+def test_cli_set_sweeps_any_setting_including_the_strategy(tmp_path, capsys):
+    from scalper.feeds import generate_synthetic, save_csv
+
+    for s, bars in generate_synthetic(["EURUSD", "GBPUSD", "USDJPY"], days=30, seed=3).items():
+        save_csv(tmp_path / f"{s}_M5.csv", bars)
+    args = ["backtest", "--data-dir", str(tmp_path), "--days", "20", "--symbols", "EURUSD", "GBPUSD", "USDJPY"]
+
+    sweep = ["--set", "strategy_name=london_breakout", "breakout.min_range_spreads=0", "breakout.profit_multiple=1,2"]
+    assert main(args + sweep) == 0
+    out = capsys.readouterr().out
+    rows = sweep_rows(out)
+    assert [r["profit_multiple"] for r in rows] == ["1", "2"]
+    assert "london_breakout: range 0000-0700" in out
+
+    assert main(args + ["--set", "strategy_name=london_breakout"]) == 0
+    out = capsys.readouterr().out
+    assert "Strategy: london_breakout" in out and "Signal time (London):" in out
+
+    assert main(args + ["--set", "breakout.nonsense=1"]) == 2
+    assert "unknown setting" in capsys.readouterr().err
+    assert main(args + ["--set", "breakout.stop=mid,wide"]) == 2  # rejected before any run
+    assert main(args + ["--set", "strategy_name=london_breakout", "--session", "1600-1900"]) == 2
+
+
+def test_shipped_breakout_config():
+    cfg = load_config(ROOT / "config" / "breakout.yaml")
+    assert cfg.mode == "PAPER" and cfg.strategy_name == "london_breakout"
+    assert cfg.symbols == ["EURUSD", "GBPUSD", "USDJPY", "EURJPY", "GBPJPY", "USDCHF"]
+    assert (cfg.breakout.range_window, cfg.breakout.entry_window, cfg.breakout.exit_time) == ("0000-0700", "0700-1000", "1600")
+    assert cfg.state_dir == "state/breakout"
+    from scalper.rates import RateBook
+
+    assert RateBook("USD").required_aux(cfg.symbols) == []  # every quote currency converts through a traded pair
