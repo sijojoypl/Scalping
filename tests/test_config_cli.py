@@ -208,10 +208,12 @@ class _FrozenDatetime:
 
 def sweep_rows(out):
     """Parse the sweep table: session, filter, trades and trades per day of each row."""
+    import re
+
     rows = []
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) < 7 or "-" not in parts[0] or not parts[0][:4].isdigit():
+        if len(parts) < 7 or not re.fullmatch(r"\d{4}-\d{4}", parts[0]):  # a session like 1600-1900
             continue
         i = 2 if parts[1] == "off" else 3  # "4x spr" takes two columns
         rows.append({"session": parts[0], "filter": parts[1], "trades": int(parts[i]), "per_day": float(parts[i + 1])})
