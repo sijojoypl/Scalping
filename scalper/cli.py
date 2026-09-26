@@ -270,8 +270,14 @@ def _sweep(cfg, data, start, charge_costs, days, ratios, sessions, run_backtest,
     print("Look for settings whose neighbours also do well, not the single best row:")
     print("one lucky setting is usually noise. Then confirm it on data it was not picked on.\n")
     print(f"  {'Session':<10} {'Min stop':>9} {'Trades':>7} {'/day':>5} {'Win %':>6} {'PF':>6} {'Net %':>8} {'Max DD %':>9}")
-    for session in sessions:
-        for ratio in ratios:
+    quiet = logging.getLogger("scalper")
+    level = quiet.level
+    try:
+        for n, (session, ratio) in enumerate((s, r) for s in sessions for r in ratios):
+            if n == 1:
+                # Data warnings (missing conversion pairs, fallback rates) are the
+                # same for every run; show them for the first one only.
+                quiet.setLevel(logging.ERROR)
             run_cfg = copy.deepcopy(cfg)
             run_cfg.strategy.session = session
             run_cfg.risk.min_stop_spread_ratio = ratio
@@ -285,6 +291,8 @@ def _sweep(cfg, data, start, charge_costs, days, ratios, sessions, run_backtest,
                 f"{st.net_profit_pct:>7.1f}% {st.max_drawdown_pct:>8.1f}%",
                 flush=True,
             )
+    finally:
+        quiet.setLevel(level)
     return 0
 
 

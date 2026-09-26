@@ -216,3 +216,15 @@ def sweep_rows(out):
         i = 2 if parts[1] == "off" else 3  # "4x spr" takes two columns
         rows.append({"session": parts[0], "filter": parts[1], "trades": int(parts[i]), "per_day": float(parts[i + 1])})
     return rows
+
+
+def test_sweep_prints_data_warnings_once(tmp_path, capsys):
+    from scalper.feeds import generate_synthetic, save_csv
+
+    for s, bars in generate_synthetic(["EURGBP"], days=30, seed=3).items():
+        save_csv(tmp_path / f"{s}_M5.csv", bars)  # no GBPUSD file on purpose
+    args = ["backtest", "--data-dir", str(tmp_path), "--days", "20", "--symbols", "EURGBP"]
+    assert main(args + ["--min-stop-spread", "0", "3", "4"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("no data for conversion pair GBPUSD") == 1
+    assert len(sweep_rows(out)) == 3
